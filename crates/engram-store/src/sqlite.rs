@@ -15,10 +15,19 @@ use crate::{
     StoreResult, TimeRangeFilter, WorkingStatePatch,
 };
 
-#[derive(Debug)]
+const SCHEMA_VERSION: i64 = 1;
+
 pub struct SqliteStore {
     path: PathBuf,
     connection: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for SqliteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteStore")
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl SqliteStore {
@@ -82,6 +91,39 @@ fn configure_connection(conn: &Connection, use_wal: bool) -> StoreResult<()> {
 }
 
 fn ensure_schema(conn: &Connection) -> StoreResult<()> {
+    conn.execute_batch(
+        "
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER NOT NULL,
+                applied_at INTEGER NOT NULL
+            );
+            ",
+    )?;
+
+    let current = match conn.query_row(
+        "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(version) => version,
+        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+        Err(err) => return Err(err.into()),
+    };
+
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::Storage(format!(
+            "database schema version {} is newer than supported {}",
+            current, SCHEMA_VERSION
+        )));
+    }
+
+    if current < SCHEMA_VERSION && current != 0 {
+        return Err(StoreError::Storage(format!(
+            "database schema version {} requires migration to {}",
+            current, SCHEMA_VERSION
+        )));
+    }
+
     conn.execute_batch(
         "
             CREATE TABLE IF NOT EXISTS events (
@@ -209,6 +251,17 @@ fn ensure_schema(conn: &Connection) -> StoreResult<()> {
                 ON context_builds (tenant_id, user_id, agent_id, session_id, run_id, ts);
             ",
     )?;
+
+    if current == 0 {
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            params_from_iter(vec![
+                SqlValue::Integer(SCHEMA_VERSION),
+                SqlValue::Integer(to_millis(Utc::now())),
+            ]),
+        )?;
+    }
+
     Ok(())
 }
 
