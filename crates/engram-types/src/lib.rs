@@ -154,20 +154,7 @@ pub struct ConversationTurn {
     #[serde(default)]
     pub evidence_id: Option<String>,
     #[serde(default)]
-    pub fact_key: String,
-    pub value: serde_json::Value,
-    #[serde(default = "default_fact_status")]
-    pub status: FactStatus,
-    #[serde(default)]
-    pub validity: Validity,
-    #[serde(default = "default_confidence")]
-    pub confidence: f64,
-    #[serde(default)]
-    pub sources: Vec<String>,
-    #[serde(default = "default_scope_level")]
-    pub scope_level: ScopeLevel,
-    #[serde(default)]
-    pub notes: String,
+    pub ts: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -178,7 +165,7 @@ pub struct Validity {
     pub valid_to: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FactStatus {
     Active,
@@ -325,7 +312,7 @@ pub enum InsightTrigger {
     Analogy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationState {
     Unvalidated,
