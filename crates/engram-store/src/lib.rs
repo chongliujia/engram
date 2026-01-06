@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 mod composer;
+mod sqlite;
 
 pub use composer::{build_memory_packet, BuildRequest, RecallCues, RecallPolicy};
+pub use sqlite::SqliteStore;
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
@@ -18,6 +20,19 @@ pub enum StoreError {
     NotFound,
     Poisoned,
     InvalidInput(String),
+    Storage(String),
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(err: rusqlite::Error) -> Self {
+        StoreError::Storage(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for StoreError {
+    fn from(err: serde_json::Error) -> Self {
+        StoreError::InvalidInput(err.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
