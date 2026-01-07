@@ -9,9 +9,17 @@ use std::sync::RwLock;
 
 mod composer;
 mod sqlite;
+#[cfg(feature = "mysql")]
+mod mysql;
+#[cfg(feature = "postgres")]
+mod postgres;
 
 pub use composer::{build_memory_packet, BuildRequest, RecallCues, RecallPolicy};
 pub use sqlite::SqliteStore;
+#[cfg(feature = "mysql")]
+pub use mysql::MySqlStore;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresStore;
 
 pub type StoreResult<T> = Result<T, StoreError>;
 

@@ -4,8 +4,12 @@ use chrono::{DateTime, TimeZone, Utc};
 use engram_store::{
     build_memory_packet, BuildRequest, EpisodeFilter, Event, EventKind, FactFilter, InsightFilter,
     RecallCues, RecallPolicy, SqliteStore, Store, StoreError, StmState, TimeRangeFilter,
-    WorkingStatePatch,
+    WorkingStatePatch, StoreResult,
 };
+#[cfg(feature = "mysql")]
+use engram_store::MySqlStore;
+#[cfg(feature = "postgres")]
+use engram_store::PostgresStore;
 use engram_types::{
     Budget, Episode, Fact, FactStatus, InsightItem, JsonMap, KeyQuote, MemoryPacket, Procedure,
     Purpose, Scope, ValidationState,
@@ -18,20 +22,28 @@ use serde_json::Value as JsonValue;
 
 #[pyclass]
 struct EngramStore {
-    inner: SqliteStore,
+    inner: Box<dyn Store>,
 }
 
 #[pymethods]
 impl EngramStore {
     #[new]
-    fn new(path: String) -> PyResult<Self> {
-        let inner = SqliteStore::new(path).map_err(store_error)?;
-        Ok(Self { inner })
+    #[pyo3(signature = (path=None, backend=None, dsn=None, database=None, in_memory=false))]
+    fn new(
+        path: Option<String>,
+        backend: Option<String>,
+        dsn: Option<String>,
+        database: Option<String>,
+        in_memory: bool,
+    ) -> PyResult<Self> {
+        let store = open_store(path, backend, dsn, database, in_memory).map_err(store_error)?;
+        Ok(Self { inner: store })
     }
 
     #[staticmethod]
     fn in_memory() -> PyResult<Self> {
-        let inner = SqliteStore::new_in_memory().map_err(store_error)?;
+        let inner: Box<dyn Store> =
+            Box::new(SqliteStore::new_in_memory().map_err(store_error)?);
         Ok(Self { inner })
     }
 
@@ -222,7 +234,7 @@ impl EngramStore {
             request.persist = persist;
         }
 
-        let packet = build_memory_packet(&self.inner, request).map_err(store_error)?;
+        let packet = build_memory_packet(self.inner.as_ref(), request).map_err(store_error)?;
         to_json(&packet)
     }
 }
@@ -617,4 +629,107 @@ fn store_error(err: StoreError) -> PyErr {
 
 fn py_error<E: std::fmt::Display>(err: E) -> PyErr {
     PyValueError::new_err(err.to_string())
+}
+
+fn open_store(
+    path: Option<String>,
+    backend: Option<String>,
+    dsn: Option<String>,
+    database: Option<String>,
+    in_memory: bool,
+) -> StoreResult<Box<dyn Store>> {
+    let backend = backend
+        .unwrap_or_else(|| "sqlite".to_string())
+        .to_lowercase();
+    match backend.as_str() {
+        "sqlite" => {
+            if in_memory {
+                Ok(Box::new(SqliteStore::new_in_memory()?))
+            } else {
+                let path = path.unwrap_or_else(|| "data/engram.db".to_string());
+                Ok(Box::new(SqliteStore::new(path)?))
+            }
+        }
+        "postgres" => {
+            if in_memory {
+                return Err(StoreError::InvalidInput(
+                    "in_memory only supported for sqlite".to_string(),
+                ));
+            }
+            let dsn = dsn.ok_or_else(|| {
+                StoreError::InvalidInput("dsn required for postgres backend".to_string())
+            })?;
+            #[cfg(feature = "postgres")]
+            {
+                let dsn = apply_database_to_dsn(&dsn, database.as_deref());
+                return Ok(Box::new(PostgresStore::new(&dsn)?));
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = (dsn, database);
+                return Err(StoreError::InvalidInput(
+                    "postgres feature not enabled".to_string(),
+                ));
+            }
+        }
+        "mysql" => {
+            if in_memory {
+                return Err(StoreError::InvalidInput(
+                    "in_memory only supported for sqlite".to_string(),
+                ));
+            }
+            let dsn =
+                dsn.ok_or_else(|| StoreError::InvalidInput("dsn required for mysql backend".to_string()))?;
+            #[cfg(feature = "mysql")]
+            {
+                let dsn = apply_database_to_dsn(&dsn, database.as_deref());
+                return Ok(Box::new(MySqlStore::new(&dsn)?));
+            }
+            #[cfg(not(feature = "mysql"))]
+            {
+                let _ = (dsn, database);
+                return Err(StoreError::InvalidInput(
+                    "mysql feature not enabled".to_string(),
+                ));
+            }
+        }
+        _ => Err(StoreError::InvalidInput(format!(
+            "unknown backend: {}",
+            backend
+        ))),
+    }
+}
+
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+fn apply_database_to_dsn(dsn: &str, database: Option<&str>) -> String {
+    let Some(database) = database else {
+        return dsn.to_string();
+    };
+    if dsn_has_database(dsn) {
+        return dsn.to_string();
+    }
+    let (base, query) = match dsn.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (dsn, None),
+    };
+    let mut normalized = if base.ends_with('/') {
+        format!("{}{}", base, database)
+    } else {
+        format!("{}/{}", base, database)
+    };
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+    normalized
+}
+
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+fn dsn_has_database(dsn: &str) -> bool {
+    let base = dsn.split('?').next().unwrap_or(dsn);
+    let scheme_end = base.find("://").map(|idx| idx + 3).unwrap_or(0);
+    match base[scheme_end..].find('/') {
+        Some(idx) => scheme_end + idx + 1 < base.len(),
+        None => false,
+    }
 }

@@ -4,11 +4,21 @@ from ._core import EngramStore
 
 
 class Memory:
-    def __init__(self, path="data/engram.db", in_memory=False):
-        if in_memory:
-            self._store = EngramStore.in_memory()
-        else:
-            self._store = EngramStore(path)
+    def __init__(
+        self,
+        path="data/engram.db",
+        in_memory=False,
+        backend="sqlite",
+        dsn=None,
+        database=None,
+    ):
+        self._store = EngramStore(
+            path=path,
+            backend=backend,
+            dsn=dsn,
+            database=database,
+            in_memory=in_memory,
+        )
 
     def append_event(self, event):
         self._store.append_event(json.dumps(event))

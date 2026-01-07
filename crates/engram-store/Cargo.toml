@@ -9,6 +9,14 @@ serde = "1"
 serde_json = "1"
 engram-types = { path = "../engram-types" }
 rusqlite = { version = "0.31", features = ["bundled"] }
+postgres = { version = "0.19", optional = true }
+r2d2 = { version = "0.8", optional = true }
+r2d2_postgres = { version = "0.18", optional = true }
+mysql = { version = "25", optional = true }
+
+[features]
+postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
+mysql = ["dep:mysql"]
 
 [dev-dependencies]
 criterion = "0.5"

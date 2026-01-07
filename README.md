@@ -50,6 +50,38 @@ packet = mem.build_memory_packet({"scope": scope, "purpose": "planner"})
 print(packet["meta"]["schema_version"])
 ```
 
+Enable MySQL/Postgres backends (rebuild required):
+
+```bash
+cd python
+maturin develop --features mysql,postgres
+```
+
+Python backends:
+
+```python
+Memory(backend="mysql", dsn="mysql://user:pass@localhost:3306/engram")
+Memory(backend="postgres", dsn="postgres://user:pass@localhost:5432/engram")
+Memory(backend="mysql", dsn="mysql://user:pass@localhost:3306", database="engram")
+```
+
+## Storage backends
+
+- SQLite (default, no feature flag)
+- Postgres (`--features postgres`)
+- MySQL (`--features mysql`)
+
+Example (MySQL):
+```rust
+use engram_store::MySqlStore;
+
+let store = MySqlStore::new("mysql://user:pass@localhost:3306/engram")?;
+```
+
+Notes:
+- If the database does not exist, Postgres/MySQL will create it on first connect.
+- If the DSN omits a database name, it defaults to `engram`.
+
 ## LangChain / LangGraph adapters (minimal stubs)
 
 - LangChain: `EngramChatMessageHistory`, `EngramContextInjector`
@@ -82,6 +114,19 @@ Tuning:
 
 - `ENGRAM_BENCH_INMEMORY_MAX_EVENTS` (default 300000)
 - `ENGRAM_BENCH_SQLITE_EVENT_CHUNK` (default 10000)
+- `ENGRAM_BENCH_MYSQL_DSN` / `ENGRAM_BENCH_POSTGRES_DSN`
+- `ENGRAM_BENCH_MYSQL_MAX_EVENTS` / `ENGRAM_BENCH_POSTGRES_MAX_EVENTS`
+- `ENGRAM_BENCH_RESET_DB` (set to `1` to truncate SQL tables before each dataset)
+
+Benchmark groups include:
+
+- `build_memory_packet_events_scale`
+- `build_memory_packet_candidate_scale`
+- `store_ops_list_events`
+- `store_ops_list_facts`
+- `store_ops_list_episodes`
+- `store_ops_list_insights`
+- `store_ops_list_procedures`
 
 Generate the HTML summary report:
 
@@ -90,6 +135,44 @@ python scripts/criterion_report.py
 ```
 
 Output: `target/criterion/summary.html`
+
+If `target/python_bench.json`, `target/python_load.json`, or `target/python_soak.json` exist, they are included in the summary.
+
+Python benchmarks (optional):
+
+```bash
+cd python
+maturin develop --features mysql,postgres
+ENGRAM_BENCH_MYSQL_DSN="mysql://user:pass@localhost:3306/engram" \
+ENGRAM_BENCH_POSTGRES_DSN="postgres://user:pass@localhost:5432/engram" \
+python python/scripts/bench_backends.py
+```
+
+Outputs: `target/python_bench.json`, `target/python_bench.html`, `target/python_bench_prev.json`
+
+Python load test (optional):
+
+```bash
+cd python
+maturin develop --features mysql,postgres
+ENGRAM_LOAD_MYSQL_DSN="mysql://user:pass@localhost:3306/engram" \
+ENGRAM_LOAD_POSTGRES_DSN="postgres://user:pass@localhost:5432/engram" \
+python python/scripts/load_test.py --duration 60 --concurrency 8
+```
+
+Outputs: `target/python_load.json`, `target/python_load_prev.json`
+
+Python soak test (optional):
+
+```bash
+cd python
+maturin develop --features mysql,postgres
+ENGRAM_SOAK_MYSQL_DSN="mysql://user:pass@localhost:3306/engram" \
+ENGRAM_SOAK_POSTGRES_DSN="postgres://user:pass@localhost:5432/engram" \
+python python/scripts/soak_test.py --duration 600 --interval 60
+```
+
+Outputs: `target/python_soak.json`, `target/python_soak_prev.json`
 
 ## Sample results (local run)
 

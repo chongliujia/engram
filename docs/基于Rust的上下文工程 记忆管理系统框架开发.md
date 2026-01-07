@@ -4,7 +4,7 @@
 
 # 0. 执行摘要
 
-本方案构建一个“类人记忆”的**上下文工程/记忆管理系统**，以 **Rust in-process 核心库（PyO3/maturin）+ Python SDK + LangChain/LangGraph 同步适配** 的形态交付。系统默认 **SQLite 零配置**，可无缝升级 **Postgres**。输出统一的 **MemoryPacket**（短期/长期/灵感分区），并内建 explain/replay、治理与评估机制。
+本方案构建一个“类人记忆”的**上下文工程/记忆管理系统**，以 **Rust in-process 核心库（PyO3/maturin）+ Python SDK + LangChain/LangGraph 同步适配** 的形态交付。系统默认 **SQLite 零配置**，可无缝升级 **Postgres / MySQL**。输出统一的 **MemoryPacket**（短期/长期/灵感分区），并内建 explain/replay、治理与评估机制。
 
 **关键差异化能力**：
 
@@ -23,19 +23,19 @@
 - 支持灵感：**Insight（假设/策略草图）**默认 run 内，验证后晋升。
 - 每次生成结构化 **MemoryPacket**：可解释、可回放、可控预算。
 - 同步覆盖 **LangChain + LangGraph**。
-- **pip 安装即用**：默认 SQLite，升级 PG。
+- **pip 安装即用**：默认 SQLite，升级 Postgres / MySQL。
 
 ## 1.2 约束（v1）
 
 - 不做 embedding、rerank；不依赖语义向量检索。
 - 回忆依赖：scope、task_type、时间窗、tags/entities、关键词、工具类型、冲突/失败信号。
-- “PG 是能力上限，不是起步门槛”：默认零配置。
+- “Postgres / MySQL 是能力上限，不是起步门槛”：默认零配置。
 
 ---
 
 # 2. 总体架构（含图）
 
-## 2.1 总体架构图（pip 本地嵌入式 + 可升级 PG）
+## 2.1 总体架构图（pip 本地嵌入式 + 可升级 Postgres / MySQL）
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -245,7 +245,7 @@ Layer 3: Assemble & Budget Trim (O(n) with small n)
 
 ---
 
-# 9. 存储：默认 SQLite + 可升级 PG（行为一致）
+# 9. 存储：默认 SQLite + 可升级 Postgres / MySQL（行为一致）
 
 ## 9.1 零配置（SQLite）
 
@@ -253,11 +253,12 @@ Layer 3: Assemble & Budget Trim (O(n) with small n)
 - WAL 模式
 - 适合个人/原型
 
-## 9.2 升级（Postgres）
+## 9.2 升级（Postgres / MySQL）
 
 - 提供 DSN 或环境变量自动切换
 - 多租户/审计/团队协作
 - 与 SQLite 保持一致的排序与裁剪规则（deterministic）
+- 数据库不存在时自动创建；未指定库名默认 `engram`
 
 ## 9.3 存储抽象契约（关键）
 
@@ -295,7 +296,7 @@ Rust Core 仅依赖“查询原语”，保证双后端一致：
 
 - `pip install yourmem`
 - 默认：本地 SQLite（无需配置）
-- 设置 `DATABASE_URL`：自动切 PG
+- 设置 `DATABASE_URL`：自动切 Postgres / MySQL
 - wheel 覆盖主流平台（Linux/macOS/Windows）
 - 提供 migrations 初始化/升级流程（对用户透明或一键执行）
 
@@ -323,7 +324,7 @@ Rust Core 仅依赖“查询原语”，保证双后端一致：
 
 Phase 1：WM/STM + MemoryPacket + LangChain/LangGraph 适配 + SQLite 默认 + explain
 
-Phase 2：Facts/ Episodes/ Procedures + Consolidation（规则版）+ PG 升级一致性
+Phase 2：Facts/ Episodes/ Procedures + Consolidation（规则版）+ Postgres / MySQL 升级一致性
 
 Phase 3：Insight（触发/验证/晋升）+ 更强评估体系 + 多租户 ACL
 
@@ -368,6 +369,7 @@ engram/
 │  ├─ engram-store/            # Storage trait + 通用查询原语
 │  ├─ engram-store-sqlite/     # SQLite 实现（默认）
 │  ├─ engram-store-postgres/   # Postgres 实现（升级）
+│  ├─ engram-store-mysql/      # MySQL 实现（升级）
 │  ├─ engram-types/            # MemoryPacket/事件/实体类型与 schema（Rust side）
 │  ├─ engram-metrics/          # 指标与 tracing（可选，建议单独）
 │  └─ engram-ffi/              # PyO3 暴露的 API（最薄层）

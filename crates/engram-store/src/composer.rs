@@ -84,7 +84,10 @@ impl BuildRequest {
     }
 }
 
-pub fn build_memory_packet<S: Store>(store: &S, request: BuildRequest) -> StoreResult<MemoryPacket> {
+pub fn build_memory_packet<S: Store + ?Sized>(
+    store: &S,
+    request: BuildRequest,
+) -> StoreResult<MemoryPacket> {
     let now = Utc::now();
     let task_type = request
         .task_type
@@ -146,7 +149,7 @@ pub fn build_memory_packet<S: Store>(store: &S, request: BuildRequest) -> StoreR
     Ok(packet)
 }
 
-fn build_short_term<S: Store>(
+fn build_short_term<S: Store + ?Sized>(
     working_state: &engram_types::WorkingState,
     stm_state: &StmState,
     store: &S,
@@ -177,7 +180,7 @@ fn build_short_term<S: Store>(
     Ok(short_term)
 }
 
-fn load_facts<S: Store>(
+fn load_facts<S: Store + ?Sized>(
     store: &S,
     scope: &Scope,
     now: DateTime<Utc>,
@@ -205,7 +208,7 @@ fn load_facts<S: Store>(
     Ok(facts)
 }
 
-fn load_procedures<S: Store>(
+fn load_procedures<S: Store + ?Sized>(
     store: &S,
     scope: &Scope,
     task_type: &str,
@@ -223,7 +226,7 @@ fn load_procedures<S: Store>(
     Ok(procedures)
 }
 
-fn load_episodes<S: Store>(
+fn load_episodes<S: Store + ?Sized>(
     store: &S,
     scope: &Scope,
     request: &BuildRequest,
@@ -259,7 +262,7 @@ fn load_episodes<S: Store>(
     Ok(episodes)
 }
 
-fn load_insights<S: Store>(
+fn load_insights<S: Store + ?Sized>(
     store: &S,
     scope: &Scope,
     request: &BuildRequest,
