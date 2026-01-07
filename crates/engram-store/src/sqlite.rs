@@ -60,16 +60,52 @@ impl SqliteStore {
         })
     }
 
+    pub fn append_events_bulk(&self, events: &[Event]) -> StoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.with_connection(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "
+                    INSERT INTO events (
+                        event_id, tenant_id, user_id, agent_id, session_id, run_id,
+                        ts, kind, payload, tags, entities
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ",
+                )?;
+                for event in events {
+                    stmt.execute(params_from_iter(vec![
+                        SqlValue::Text(event.event_id.clone()),
+                        SqlValue::Text(event.scope.tenant_id.clone()),
+                        SqlValue::Text(event.scope.user_id.clone()),
+                        SqlValue::Text(event.scope.agent_id.clone()),
+                        SqlValue::Text(event.scope.session_id.clone()),
+                        SqlValue::Text(event.scope.run_id.clone()),
+                        SqlValue::Integer(to_millis(event.ts)),
+                        SqlValue::Text(event_kind_to_str(&event.kind).to_string()),
+                        SqlValue::Text(encode_json(&event.payload)?),
+                        SqlValue::Text(encode_json(&event.tags)?),
+                        SqlValue::Text(encode_json(&event.entities)?),
+                    ]))?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     fn with_connection<F, T>(&self, f: F) -> StoreResult<T>
     where
-        F: FnOnce(&Connection) -> StoreResult<T>,
+        F: FnOnce(&mut Connection) -> StoreResult<T>,
     {
-        let guard = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
-        f(&*guard)
+        let mut guard = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        f(&mut *guard)
     }
 }
 

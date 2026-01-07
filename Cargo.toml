@@ -1,9 +1,8 @@
 [workspace]
-members = ["crates/engram-types", "crates/engram-store"]
+members = ["crates/engram-types", "crates/engram-store", "crates/engram-ffi"]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-
 
