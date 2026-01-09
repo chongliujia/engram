@@ -1,3 +1,13 @@
 .env
 python/.env
 bench/engram_bench.env
+
+# Rust build artifacts
+target/
+**/target/
+
+# SQLite / DB artifacts (optional, but recommended for benches)
+*.db
+*.sqlite
+*.sqlite3
+
