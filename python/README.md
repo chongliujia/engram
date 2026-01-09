@@ -107,6 +107,12 @@ Outputs:
 - `target/python_bench.html`
 - `target/python_bench_prev.json` (auto-saved previous run)
 
+Config file (optional):
+
+- Copy `bench/engram_bench.env.example` to `bench/engram_bench.env`.
+- Set `ENGRAM_BENCH_CONFIG=/path/to/engram_bench.env` to use a custom path.
+- The Python benchmark scripts read this file for defaults if present.
+
 ## Load test (Python)
 
 ```bash

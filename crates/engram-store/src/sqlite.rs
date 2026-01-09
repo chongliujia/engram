@@ -7,6 +7,7 @@ use rusqlite::types::{Type, Value as SqlValue};
 use rusqlite::{params_from_iter, Connection};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -66,31 +67,69 @@ impl SqliteStore {
         }
         self.with_connection(|conn| {
             let tx = conn.transaction()?;
-            {
-                let mut stmt = tx.prepare(
-                    "
-                    INSERT INTO events (
-                        event_id, tenant_id, user_id, agent_id, session_id, run_id,
-                        ts, kind, payload, tags, entities
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ",
-                )?;
-                for event in events {
-                    stmt.execute(params_from_iter(vec![
-                        SqlValue::Text(event.event_id.clone()),
+            let mut stmt_event = tx.prepare(
+                "
+                INSERT INTO events (
+                    event_id, tenant_id, user_id, agent_id, session_id, run_id,
+                    ts, kind, payload, tags, entities
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ",
+            )?;
+            let mut stmt_tag = tx.prepare(
+                "
+                INSERT OR IGNORE INTO event_tags (
+                    tenant_id, user_id, agent_id, session_id, run_id, event_id, tag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ",
+            )?;
+            let mut stmt_entity = tx.prepare(
+                "
+                INSERT OR IGNORE INTO event_entities (
+                    tenant_id, user_id, agent_id, session_id, run_id, event_id, entity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ",
+            )?;
+            for event in events {
+                stmt_event.execute(params_from_iter(vec![
+                    SqlValue::Text(event.event_id.clone()),
+                    SqlValue::Text(event.scope.tenant_id.clone()),
+                    SqlValue::Text(event.scope.user_id.clone()),
+                    SqlValue::Text(event.scope.agent_id.clone()),
+                    SqlValue::Text(event.scope.session_id.clone()),
+                    SqlValue::Text(event.scope.run_id.clone()),
+                    SqlValue::Integer(to_millis(event.ts)),
+                    SqlValue::Text(event_kind_to_str(&event.kind).to_string()),
+                    SqlValue::Text(encode_json(&event.payload)?),
+                    SqlValue::Text(encode_json(&event.tags)?),
+                    SqlValue::Text(encode_json(&event.entities)?),
+                ]))?;
+
+                for tag in unique_values(&event.tags) {
+                    stmt_tag.execute(params_from_iter(vec![
                         SqlValue::Text(event.scope.tenant_id.clone()),
                         SqlValue::Text(event.scope.user_id.clone()),
                         SqlValue::Text(event.scope.agent_id.clone()),
                         SqlValue::Text(event.scope.session_id.clone()),
                         SqlValue::Text(event.scope.run_id.clone()),
-                        SqlValue::Integer(to_millis(event.ts)),
-                        SqlValue::Text(event_kind_to_str(&event.kind).to_string()),
-                        SqlValue::Text(encode_json(&event.payload)?),
-                        SqlValue::Text(encode_json(&event.tags)?),
-                        SqlValue::Text(encode_json(&event.entities)?),
+                        SqlValue::Text(event.event_id.clone()),
+                        SqlValue::Text(tag),
+                    ]))?;
+                }
+                for entity in unique_values(&event.entities) {
+                    stmt_entity.execute(params_from_iter(vec![
+                        SqlValue::Text(event.scope.tenant_id.clone()),
+                        SqlValue::Text(event.scope.user_id.clone()),
+                        SqlValue::Text(event.scope.agent_id.clone()),
+                        SqlValue::Text(event.scope.session_id.clone()),
+                        SqlValue::Text(event.scope.run_id.clone()),
+                        SqlValue::Text(event.event_id.clone()),
+                        SqlValue::Text(entity),
                     ]))?;
                 }
             }
+            drop(stmt_entity);
+            drop(stmt_tag);
+            drop(stmt_event);
             tx.commit()?;
             Ok(())
         })
@@ -177,6 +216,51 @@ fn ensure_schema(conn: &Connection) -> StoreResult<()> {
             );
             CREATE INDEX IF NOT EXISTS events_scope_ts
                 ON events (tenant_id, user_id, agent_id, session_id, run_id, ts);
+            CREATE TABLE IF NOT EXISTS event_tags (
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (
+                    tenant_id,
+                    user_id,
+                    agent_id,
+                    session_id,
+                    run_id,
+                    event_id,
+                    tag
+                )
+            );
+            CREATE INDEX IF NOT EXISTS event_tags_scope_tag
+                ON event_tags (tenant_id, user_id, agent_id, session_id, run_id, tag);
+            CREATE INDEX IF NOT EXISTS event_tags_scope_event
+                ON event_tags (tenant_id, user_id, agent_id, session_id, run_id, event_id);
+
+            CREATE TABLE IF NOT EXISTS event_entities (
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                PRIMARY KEY (
+                    tenant_id,
+                    user_id,
+                    agent_id,
+                    session_id,
+                    run_id,
+                    event_id,
+                    entity
+                )
+            );
+            CREATE INDEX IF NOT EXISTS event_entities_scope_entity
+                ON event_entities (tenant_id, user_id, agent_id, session_id, run_id, entity);
+            CREATE INDEX IF NOT EXISTS event_entities_scope_event
+                ON event_entities (tenant_id, user_id, agent_id, session_id, run_id, event_id);
 
             CREATE TABLE IF NOT EXISTS wm_state (
                 tenant_id TEXT NOT NULL,
@@ -237,6 +321,31 @@ fn ensure_schema(conn: &Connection) -> StoreResult<()> {
             );
             CREATE INDEX IF NOT EXISTS episodes_scope_start
                 ON episodes (tenant_id, user_id, agent_id, start_ts);
+            CREATE TABLE IF NOT EXISTS episode_tags (
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, user_id, agent_id, episode_id, tag)
+            );
+            CREATE INDEX IF NOT EXISTS episode_tags_scope_tag
+                ON episode_tags (tenant_id, user_id, agent_id, tag);
+            CREATE INDEX IF NOT EXISTS episode_tags_scope_episode
+                ON episode_tags (tenant_id, user_id, agent_id, episode_id);
+
+            CREATE TABLE IF NOT EXISTS episode_entities (
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                episode_id TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, user_id, agent_id, episode_id, entity)
+            );
+            CREATE INDEX IF NOT EXISTS episode_entities_scope_entity
+                ON episode_entities (tenant_id, user_id, agent_id, entity);
+            CREATE INDEX IF NOT EXISTS episode_entities_scope_episode
+                ON episode_entities (tenant_id, user_id, agent_id, episode_id);
 
             CREATE TABLE IF NOT EXISTS procedures (
                 tenant_id TEXT NOT NULL,
@@ -303,8 +412,18 @@ fn ensure_schema(conn: &Connection) -> StoreResult<()> {
 
 impl Store for SqliteStore {
     fn append_event(&self, event: Event) -> StoreResult<()> {
+        let Event {
+            event_id,
+            scope,
+            ts,
+            kind,
+            payload,
+            tags,
+            entities,
+        } = event;
         self.with_connection(|conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "
                 INSERT INTO events (
                     event_id, tenant_id, user_id, agent_id, session_id, run_id,
@@ -312,19 +431,21 @@ impl Store for SqliteStore {
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ",
                 params_from_iter(vec![
-                    SqlValue::Text(event.event_id),
-                    SqlValue::Text(event.scope.tenant_id),
-                    SqlValue::Text(event.scope.user_id),
-                    SqlValue::Text(event.scope.agent_id),
-                    SqlValue::Text(event.scope.session_id),
-                    SqlValue::Text(event.scope.run_id),
-                    SqlValue::Integer(to_millis(event.ts)),
-                    SqlValue::Text(event_kind_to_str(&event.kind).to_string()),
-                    SqlValue::Text(encode_json(&event.payload)?),
-                    SqlValue::Text(encode_json(&event.tags)?),
-                    SqlValue::Text(encode_json(&event.entities)?),
+                    SqlValue::Text(event_id.clone()),
+                    SqlValue::Text(scope.tenant_id.clone()),
+                    SqlValue::Text(scope.user_id.clone()),
+                    SqlValue::Text(scope.agent_id.clone()),
+                    SqlValue::Text(scope.session_id.clone()),
+                    SqlValue::Text(scope.run_id.clone()),
+                    SqlValue::Integer(to_millis(ts)),
+                    SqlValue::Text(event_kind_to_str(&kind).to_string()),
+                    SqlValue::Text(encode_json(&payload)?),
+                    SqlValue::Text(encode_json(&tags)?),
+                    SqlValue::Text(encode_json(&entities)?),
                 ]),
             )?;
+            insert_event_tags(&tx, &scope, &event_id, &tags, &entities)?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -633,6 +754,8 @@ impl Store for SqliteStore {
                  FROM episodes WHERE tenant_id = ? AND user_id = ? AND agent_id = ?",
             );
             let mut params = scope_params_ltm(scope);
+            let mut filter_tags_in_memory = false;
+            let mut filter_entities_in_memory = false;
 
             if let Some(range) = &filter.time_range {
                 if let Some(start) = range.start {
@@ -645,11 +768,55 @@ impl Store for SqliteStore {
                 }
             }
 
+            if !filter.tags.is_empty() {
+                if episode_tags_present(conn, scope)? {
+                    let placeholders = sql_placeholders(filter.tags.len());
+                    sql.push_str(
+                        " AND EXISTS (
+                            SELECT 1 FROM episode_tags t
+                            WHERE t.tenant_id = episodes.tenant_id
+                              AND t.user_id = episodes.user_id
+                              AND t.agent_id = episodes.agent_id
+                              AND t.episode_id = episodes.episode_id
+                              AND t.tag IN (",
+                    );
+                    sql.push_str(&placeholders);
+                    sql.push_str("))");
+                    for tag in &filter.tags {
+                        params.push(SqlValue::Text(tag.clone()));
+                    }
+                } else {
+                    filter_tags_in_memory = true;
+                }
+            }
+
+            if !filter.entities.is_empty() {
+                if episode_entities_present(conn, scope)? {
+                    let placeholders = sql_placeholders(filter.entities.len());
+                    sql.push_str(
+                        " AND EXISTS (
+                            SELECT 1 FROM episode_entities e
+                            WHERE e.tenant_id = episodes.tenant_id
+                              AND e.user_id = episodes.user_id
+                              AND e.agent_id = episodes.agent_id
+                              AND e.episode_id = episodes.episode_id
+                              AND e.entity IN (",
+                    );
+                    sql.push_str(&placeholders);
+                    sql.push_str("))");
+                    for entity in &filter.entities {
+                        params.push(SqlValue::Text(entity.clone()));
+                    }
+                } else {
+                    filter_entities_in_memory = true;
+                }
+            }
+
             sql.push_str(" ORDER BY start_ts ASC, episode_id ASC");
-            let limit_in_sql = if filter.tags.is_empty() && filter.entities.is_empty() {
-                filter.limit
-            } else {
+            let limit_in_sql = if filter_tags_in_memory || filter_entities_in_memory {
                 None
+            } else {
+                filter.limit
             };
             if let Some(limit) = limit_in_sql {
                 sql.push_str(" LIMIT ?");
@@ -684,25 +851,25 @@ impl Store for SqliteStore {
                 episodes.push(episode?);
             }
 
-            if filter.tags.is_empty() && filter.entities.is_empty() {
+            if !filter_tags_in_memory && !filter_entities_in_memory {
                 return Ok(episodes);
             }
 
             let mut filtered = episodes
                 .into_iter()
                 .filter(|episode| {
-                    let tags_ok = if filter.tags.is_empty() {
-                        true
-                    } else {
+                    let tags_ok = if filter_tags_in_memory {
                         episode.tags.iter().any(|tag| filter.tags.contains(tag))
-                    };
-                    let entities_ok = if filter.entities.is_empty() {
-                        true
                     } else {
+                        true
+                    };
+                    let entities_ok = if filter_entities_in_memory {
                         episode
                             .entities
                             .iter()
                             .any(|entity| filter.entities.contains(entity))
+                    } else {
+                        true
                     };
                     tags_ok && entities_ok
                 })
@@ -722,7 +889,8 @@ impl Store for SqliteStore {
 
     fn append_episode(&self, scope: &Scope, episode: Episode) -> StoreResult<()> {
         self.with_connection(|conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "
                 INSERT INTO episodes (
                     tenant_id, user_id, agent_id, episode_id, start_ts, end_ts, summary,
@@ -733,7 +901,7 @@ impl Store for SqliteStore {
                     SqlValue::Text(scope.tenant_id.clone()),
                     SqlValue::Text(scope.user_id.clone()),
                     SqlValue::Text(scope.agent_id.clone()),
-                    SqlValue::Text(episode.episode_id),
+                    SqlValue::Text(episode.episode_id.clone()),
                     SqlValue::Integer(to_millis(episode.time_range.start)),
                     option_ts_to_value(episode.time_range.end),
                     SqlValue::Text(episode.summary),
@@ -745,6 +913,14 @@ impl Store for SqliteStore {
                     option_f64_to_value(episode.recency_score),
                 ]),
             )?;
+            insert_episode_tags(
+                &tx,
+                scope,
+                &episode.episode_id,
+                &episode.tags,
+                &episode.entities,
+            )?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1025,6 +1201,162 @@ fn scope_params_ltm(scope: &Scope) -> Vec<SqlValue> {
         SqlValue::Text(scope.user_id.clone()),
         SqlValue::Text(scope.agent_id.clone()),
     ]
+}
+
+fn unique_values(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+fn sql_placeholders(count: usize) -> String {
+    let mut out = String::new();
+    for idx in 0..count {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push('?');
+    }
+    out
+}
+
+fn insert_event_tags(
+    conn: &Connection,
+    scope: &Scope,
+    event_id: &str,
+    tags: &[String],
+    entities: &[String],
+) -> StoreResult<()> {
+    if tags.is_empty() && entities.is_empty() {
+        return Ok(());
+    }
+    let tags = unique_values(tags);
+    let entities = unique_values(entities);
+
+    if !tags.is_empty() {
+        let mut stmt = conn.prepare(
+            "
+            INSERT OR IGNORE INTO event_tags (
+                tenant_id, user_id, agent_id, session_id, run_id, event_id, tag
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ",
+        )?;
+        for tag in tags {
+            stmt.execute(params_from_iter(vec![
+                SqlValue::Text(scope.tenant_id.clone()),
+                SqlValue::Text(scope.user_id.clone()),
+                SqlValue::Text(scope.agent_id.clone()),
+                SqlValue::Text(scope.session_id.clone()),
+                SqlValue::Text(scope.run_id.clone()),
+                SqlValue::Text(event_id.to_string()),
+                SqlValue::Text(tag),
+            ]))?;
+        }
+    }
+
+    if !entities.is_empty() {
+        let mut stmt = conn.prepare(
+            "
+            INSERT OR IGNORE INTO event_entities (
+                tenant_id, user_id, agent_id, session_id, run_id, event_id, entity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ",
+        )?;
+        for entity in entities {
+            stmt.execute(params_from_iter(vec![
+                SqlValue::Text(scope.tenant_id.clone()),
+                SqlValue::Text(scope.user_id.clone()),
+                SqlValue::Text(scope.agent_id.clone()),
+                SqlValue::Text(scope.session_id.clone()),
+                SqlValue::Text(scope.run_id.clone()),
+                SqlValue::Text(event_id.to_string()),
+                SqlValue::Text(entity),
+            ]))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_episode_tags(
+    conn: &Connection,
+    scope: &Scope,
+    episode_id: &str,
+    tags: &[String],
+    entities: &[String],
+) -> StoreResult<()> {
+    if tags.is_empty() && entities.is_empty() {
+        return Ok(());
+    }
+    let tags = unique_values(tags);
+    let entities = unique_values(entities);
+
+    if !tags.is_empty() {
+        let mut stmt = conn.prepare(
+            "
+            INSERT OR IGNORE INTO episode_tags (
+                tenant_id, user_id, agent_id, episode_id, tag
+            ) VALUES (?, ?, ?, ?, ?)
+            ",
+        )?;
+        for tag in tags {
+            stmt.execute(params_from_iter(vec![
+                SqlValue::Text(scope.tenant_id.clone()),
+                SqlValue::Text(scope.user_id.clone()),
+                SqlValue::Text(scope.agent_id.clone()),
+                SqlValue::Text(episode_id.to_string()),
+                SqlValue::Text(tag),
+            ]))?;
+        }
+    }
+
+    if !entities.is_empty() {
+        let mut stmt = conn.prepare(
+            "
+            INSERT OR IGNORE INTO episode_entities (
+                tenant_id, user_id, agent_id, episode_id, entity
+            ) VALUES (?, ?, ?, ?, ?)
+            ",
+        )?;
+        for entity in entities {
+            stmt.execute(params_from_iter(vec![
+                SqlValue::Text(scope.tenant_id.clone()),
+                SqlValue::Text(scope.user_id.clone()),
+                SqlValue::Text(scope.agent_id.clone()),
+                SqlValue::Text(episode_id.to_string()),
+                SqlValue::Text(entity),
+            ]))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn episode_tags_present(conn: &Connection, scope: &Scope) -> StoreResult<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT 1 FROM episode_tags WHERE tenant_id = ? AND user_id = ? AND agent_id = ? LIMIT 1",
+    )?;
+    match stmt.query_row(params_from_iter(scope_params_ltm(scope)), |_| Ok(())) {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn episode_entities_present(conn: &Connection, scope: &Scope) -> StoreResult<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT 1 FROM episode_entities WHERE tenant_id = ? AND user_id = ? AND agent_id = ? LIMIT 1",
+    )?;
+    match stmt.query_row(params_from_iter(scope_params_ltm(scope)), |_| Ok(())) {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn event_kind_to_str(kind: &EventKind) -> &'static str {

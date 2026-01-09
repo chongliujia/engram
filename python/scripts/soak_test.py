@@ -6,8 +6,16 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+import sys
 
 from engram import Memory
+from bench_config import (
+    env_float,
+    env_int,
+    env_str,
+    find_config_arg,
+    load_bench_env,
+)
 
 
 def unique_suffix():
@@ -53,9 +61,9 @@ def seed_events(mem, scope, events):
 def resolve_backend(args):
     if args.backend:
         return args.backend
-    if os.getenv("ENGRAM_SOAK_MYSQL_DSN"):
+    if env_str("ENGRAM_SOAK_MYSQL_DSN"):
         return "mysql"
-    if os.getenv("ENGRAM_SOAK_POSTGRES_DSN"):
+    if env_str("ENGRAM_SOAK_POSTGRES_DSN"):
         return "postgres"
     return "sqlite-file"
 
@@ -69,12 +77,12 @@ def build_memory_for_backend(name, args):
         tmpdir = tempfile.mkdtemp()
         return Memory(path=os.path.join(tmpdir, "engram.db"))
     if name == "mysql":
-        dsn = os.getenv("ENGRAM_SOAK_MYSQL_DSN")
-        database = os.getenv("ENGRAM_SOAK_MYSQL_DB")
+        dsn = env_str("ENGRAM_SOAK_MYSQL_DSN")
+        database = env_str("ENGRAM_SOAK_MYSQL_DB")
         return Memory(backend="mysql", dsn=dsn, database=database)
     if name == "postgres":
-        dsn = os.getenv("ENGRAM_SOAK_POSTGRES_DSN")
-        database = os.getenv("ENGRAM_SOAK_POSTGRES_DB")
+        dsn = env_str("ENGRAM_SOAK_POSTGRES_DSN")
+        database = env_str("ENGRAM_SOAK_POSTGRES_DB")
         return Memory(backend="postgres", dsn=dsn, database=database)
     raise ValueError(f"unknown backend: {name}")
 
@@ -150,19 +158,69 @@ def run_soak(mem, duration_s, interval_s, seed_events_count, mix, list_limit):
 
 
 def main():
+    config_arg = find_config_arg(sys.argv[1:])
+    load_bench_env(config_arg)
     repo_root = Path(__file__).resolve().parents[2]
     default_output = repo_root / "target" / "python_soak.json"
 
     parser = argparse.ArgumentParser(description="Soak test for Engram backends.")
-    parser.add_argument("--backend", default=None, help="Optional backend override.")
-    parser.add_argument("--duration", type=int, default=600, help="Duration in seconds.")
-    parser.add_argument("--interval", type=int, default=60, help="Interval in seconds.")
-    parser.add_argument("--seed-events", type=int, default=2000, help="Seed events count.")
-    parser.add_argument("--list-limit", type=int, default=50, help="list_events limit.")
-    parser.add_argument("--append-ratio", type=float, default=0.3, help="Append ratio.")
-    parser.add_argument("--list-ratio", type=float, default=0.4, help="List ratio.")
-    parser.add_argument("--build-ratio", type=float, default=0.3, help="Build ratio.")
-    parser.add_argument("--sqlite-path", default=None, help="Optional SQLite file path.")
+    parser.add_argument(
+        "--config",
+        default=config_arg,
+        help="Optional bench config file path.",
+    )
+    parser.add_argument(
+        "--backend",
+        default=env_str("ENGRAM_SOAK_BACKEND"),
+        help="Optional backend override.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=env_int("ENGRAM_SOAK_DURATION", 600),
+        help="Duration in seconds.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=env_int("ENGRAM_SOAK_INTERVAL", 60),
+        help="Interval in seconds.",
+    )
+    parser.add_argument(
+        "--seed-events",
+        type=int,
+        default=env_int("ENGRAM_SOAK_SEED_EVENTS", 2000),
+        help="Seed events count.",
+    )
+    parser.add_argument(
+        "--list-limit",
+        type=int,
+        default=env_int("ENGRAM_SOAK_LIST_LIMIT", 50),
+        help="list_events limit.",
+    )
+    parser.add_argument(
+        "--append-ratio",
+        type=float,
+        default=env_float("ENGRAM_SOAK_APPEND_RATIO", 0.3),
+        help="Append ratio.",
+    )
+    parser.add_argument(
+        "--list-ratio",
+        type=float,
+        default=env_float("ENGRAM_SOAK_LIST_RATIO", 0.4),
+        help="List ratio.",
+    )
+    parser.add_argument(
+        "--build-ratio",
+        type=float,
+        default=env_float("ENGRAM_SOAK_BUILD_RATIO", 0.3),
+        help="Build ratio.",
+    )
+    parser.add_argument(
+        "--sqlite-path",
+        default=env_str("ENGRAM_SOAK_SQLITE_PATH"),
+        help="Optional SQLite file path.",
+    )
     parser.add_argument("--output", default=str(default_output), help="Output JSON path.")
     args = parser.parse_args()
 

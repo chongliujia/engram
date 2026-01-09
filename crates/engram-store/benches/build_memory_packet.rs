@@ -1,6 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::fs;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::Once;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -36,29 +39,39 @@ const AGENT_ID: &str = "bench-agent";
 const SESSION_ID: &str = "bench-session";
 const RUN_ID: &str = "bench-run";
 const MAX_IN_MEMORY_EVENTS: usize = 300_000;
+const MAX_SQLITE_EVENTS: usize = 1_000_000;
 #[cfg(feature = "mysql")]
 const MAX_MYSQL_EVENTS: usize = 50_000;
 #[cfg(feature = "postgres")]
 const MAX_POSTGRES_EVENTS: usize = 50_000;
 const SQLITE_EVENT_CHUNK: usize = 10_000;
+static BENCH_ENV_LOADED: Once = Once::new();
 #[cfg(feature = "mysql")]
-const MYSQL_RESET_TABLES: [&str; 8] = [
+const MYSQL_RESET_TABLES: [&str; 12] = [
     "events",
+    "event_tags",
+    "event_entities",
     "wm_state",
     "stm_state",
     "facts",
     "episodes",
+    "episode_tags",
+    "episode_entities",
     "procedures",
     "insights",
     "context_builds",
 ];
 #[cfg(feature = "postgres")]
-const POSTGRES_RESET_TABLES: [&str; 8] = [
+const POSTGRES_RESET_TABLES: [&str; 12] = [
     "events",
+    "event_tags",
+    "event_entities",
     "wm_state",
     "stm_state",
     "facts",
     "episodes",
+    "episode_tags",
+    "episode_entities",
     "procedures",
     "insights",
     "context_builds",
@@ -71,6 +84,13 @@ struct DatasetSize {
     episodes: usize,
     procedures: usize,
     insights: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SqliteMode {
+    Memory,
+    File,
+    Auto,
 }
 
 impl DatasetSize {
@@ -254,6 +274,7 @@ fn seed_events_sqlite(store: &SqliteStore, size: DatasetSize, scope: &Scope, pre
     }
 }
 
+#[cfg(any(feature = "mysql", feature = "postgres"))]
 fn seed_events_store<S: Store + ?Sized>(
     store: &S,
     size: DatasetSize,
@@ -298,7 +319,11 @@ fn bench_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) 
 }
 
 fn bench_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
-    let store = SqliteStore::new_in_memory().unwrap();
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("build_memory_packet_sqlite_{}", size.label()))
+    else {
+        return;
+    };
     let scope = scope_for_size(size);
     seed_store_common(&store, size, &scope);
     let event_prefix = event_id_prefix(&scope);
@@ -314,6 +339,8 @@ fn bench_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
             })
         },
     );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
 }
 
 #[cfg(feature = "mysql")]
@@ -371,6 +398,7 @@ fn bench_postgres(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
 }
 
 fn build_memory_packet_bench(c: &mut Criterion) {
+    load_bench_env();
     let mut group = c.benchmark_group("build_memory_packet_events_scale");
     group.sample_size(25);
     group.warm_up_time(Duration::from_secs(3));
@@ -433,6 +461,20 @@ fn build_memory_packet_bench(c: &mut Criterion) {
             insights: 100,
         });
     }
+
+    for events in parse_usize_list_env("ENGRAM_BENCH_EVENTS_SCALES") {
+        if event_scale_sizes.iter().any(|size| size.events == events) {
+            continue;
+        }
+        event_scale_sizes.push(DatasetSize {
+            events,
+            facts: 500,
+            episodes: 1000,
+            procedures: 50,
+            insights: 100,
+        });
+    }
+    event_scale_sizes.sort_by_key(|size| size.events);
 
     for size in event_scale_sizes {
         bench_in_memory(&mut group, size);
@@ -512,6 +554,7 @@ fn build_memory_packet_bench(c: &mut Criterion) {
 }
 
 fn store_ops_bench(c: &mut Criterion) {
+    load_bench_env();
     let mut events_group = c.benchmark_group("store_ops_list_events");
     events_group.sample_size(20);
     events_group.warm_up_time(Duration::from_secs(2));
@@ -581,6 +624,47 @@ fn store_ops_bench(c: &mut Criterion) {
         bench_list_procedures_postgres(&mut procedures_group, size);
     }
     procedures_group.finish();
+
+    let mut append_group = c.benchmark_group("store_ops_append_event");
+    append_group.sample_size(20);
+    append_group.warm_up_time(Duration::from_secs(2));
+    append_group.measurement_time(Duration::from_secs(5));
+    for size in write_event_sizes() {
+        bench_append_event_in_memory(&mut append_group, size);
+        bench_append_event_sqlite(&mut append_group, size);
+        #[cfg(feature = "mysql")]
+        bench_append_event_mysql(&mut append_group, size);
+        #[cfg(feature = "postgres")]
+        bench_append_event_postgres(&mut append_group, size);
+    }
+    append_group.finish();
+
+    let mut bulk_group = c.benchmark_group("store_ops_append_events_bulk");
+    bulk_group.sample_size(15);
+    bulk_group.warm_up_time(Duration::from_secs(2));
+    bulk_group.measurement_time(Duration::from_secs(5));
+    for size in write_event_bulk_sizes() {
+        bench_append_events_bulk_sqlite(&mut bulk_group, size);
+        #[cfg(feature = "mysql")]
+        bench_append_events_bulk_mysql(&mut bulk_group, size);
+        #[cfg(feature = "postgres")]
+        bench_append_events_bulk_postgres(&mut bulk_group, size);
+    }
+    bulk_group.finish();
+
+    let mut upsert_group = c.benchmark_group("store_ops_upsert_fact");
+    upsert_group.sample_size(20);
+    upsert_group.warm_up_time(Duration::from_secs(2));
+    upsert_group.measurement_time(Duration::from_secs(5));
+    for size in write_fact_sizes() {
+        bench_upsert_fact_in_memory(&mut upsert_group, size);
+        bench_upsert_fact_sqlite(&mut upsert_group, size);
+        #[cfg(feature = "mysql")]
+        bench_upsert_fact_mysql(&mut upsert_group, size);
+        #[cfg(feature = "postgres")]
+        bench_upsert_fact_postgres(&mut upsert_group, size);
+    }
+    upsert_group.finish();
 }
 
 fn list_events_sizes() -> Vec<DatasetSize> {
@@ -823,6 +907,161 @@ fn list_procedures_sizes() -> Vec<DatasetSize> {
     sizes
 }
 
+fn write_event_sizes() -> Vec<DatasetSize> {
+    let mut sizes = vec![
+        DatasetSize {
+            events: 0,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+        DatasetSize {
+            events: 10_000,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+        DatasetSize {
+            events: 100_000,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+    ];
+
+    if is_extended() {
+        sizes.push(DatasetSize {
+            events: 300_000,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+
+    if is_extreme() {
+        sizes.push(DatasetSize {
+            events: 1_000_000,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+
+    for events in parse_usize_list_env("ENGRAM_BENCH_WRITE_EVENTS_SCALES") {
+        if sizes.iter().any(|size| size.events == events) {
+            continue;
+        }
+        sizes.push(DatasetSize {
+            events,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+    sizes.sort_by_key(|size| size.events);
+    sizes
+}
+
+fn write_event_bulk_sizes() -> Vec<DatasetSize> {
+    let mut sizes = vec![
+        DatasetSize {
+            events: 0,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+        DatasetSize {
+            events: 10_000,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+    ];
+    for events in parse_usize_list_env("ENGRAM_BENCH_BULK_EVENTS_SCALES") {
+        if sizes.iter().any(|size| size.events == events) {
+            continue;
+        }
+        sizes.push(DatasetSize {
+            events,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+    sizes.sort_by_key(|size| size.events);
+    sizes
+}
+
+fn write_fact_sizes() -> Vec<DatasetSize> {
+    let mut sizes = vec![
+        DatasetSize {
+            events: 0,
+            facts: 0,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+        DatasetSize {
+            events: 0,
+            facts: 200,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+        DatasetSize {
+            events: 0,
+            facts: 1000,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        },
+    ];
+
+    if is_extended() {
+        sizes.push(DatasetSize {
+            events: 0,
+            facts: 5000,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+
+    if is_extreme() {
+        sizes.push(DatasetSize {
+            events: 0,
+            facts: 10000,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+
+    for facts in parse_usize_list_env("ENGRAM_BENCH_WRITE_FACT_SCALES") {
+        if sizes.iter().any(|size| size.facts == facts) {
+            continue;
+        }
+        sizes.push(DatasetSize {
+            events: 0,
+            facts,
+            episodes: 0,
+            procedures: 0,
+            insights: 0,
+        });
+    }
+    sizes.sort_by_key(|size| size.facts);
+    sizes
+}
+
 fn bench_list_events_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
     if size.events > max_in_memory_events() {
         return;
@@ -847,7 +1086,11 @@ fn bench_list_events_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size: D
 }
 
 fn bench_list_events_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
-    let store = SqliteStore::new_in_memory().unwrap();
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("list_events_sqlite_{}", size.label()))
+    else {
+        return;
+    };
     let scope = scope_for_size(size);
     seed_store_common(&store, size, &scope);
     let event_prefix = event_id_prefix(&scope);
@@ -864,6 +1107,8 @@ fn bench_list_events_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: Data
             })
         },
     );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
 }
 
 #[cfg(feature = "mysql")]
@@ -943,7 +1188,11 @@ fn bench_list_facts_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size: Da
 }
 
 fn bench_list_facts_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
-    let store = SqliteStore::new_in_memory().unwrap();
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("list_facts_sqlite_{}", size.label()))
+    else {
+        return;
+    };
     let scope = scope_for_size(size);
     seed_store_common(&store, size, &scope);
     let filter = FactFilter {
@@ -960,6 +1209,8 @@ fn bench_list_facts_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: Datas
             })
         },
     );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
 }
 
 #[cfg(feature = "mysql")]
@@ -1033,7 +1284,11 @@ fn bench_list_episodes_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size:
 }
 
 fn bench_list_episodes_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
-    let store = SqliteStore::new_in_memory().unwrap();
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("list_episodes_sqlite_{}", size.label()))
+    else {
+        return;
+    };
     let scope = scope_for_size(size);
     seed_store_common(&store, size, &scope);
     let filter = EpisodeFilter {
@@ -1050,6 +1305,8 @@ fn bench_list_episodes_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: Da
             })
         },
     );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
 }
 
 #[cfg(feature = "mysql")]
@@ -1123,7 +1380,11 @@ fn bench_list_insights_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size:
 }
 
 fn bench_list_insights_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
-    let store = SqliteStore::new_in_memory().unwrap();
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("list_insights_sqlite_{}", size.label()))
+    else {
+        return;
+    };
     let scope = scope_for_size(size);
     seed_store_common(&store, size, &scope);
     let filter = InsightFilter {
@@ -1140,6 +1401,8 @@ fn bench_list_insights_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: Da
             })
         },
     );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
 }
 
 #[cfg(feature = "mysql")]
@@ -1210,7 +1473,11 @@ fn bench_list_procedures_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, siz
 }
 
 fn bench_list_procedures_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
-    let store = SqliteStore::new_in_memory().unwrap();
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("list_procedures_sqlite_{}", size.label()))
+    else {
+        return;
+    };
     let scope = scope_for_size(size);
     seed_store_common(&store, size, &scope);
     let limit = Some(200);
@@ -1224,6 +1491,8 @@ fn bench_list_procedures_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: 
             })
         },
     );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
 }
 
 #[cfg(feature = "mysql")]
@@ -1270,6 +1539,456 @@ fn bench_list_procedures_postgres(group: &mut BenchmarkGroup<'_, WallTime>, size
     );
 }
 
+fn build_write_event(scope: &Scope, event_id: String, ts: chrono::DateTime<Utc>) -> Event {
+    Event {
+        event_id,
+        scope: scope.clone(),
+        ts,
+        kind: EventKind::Message,
+        payload: json!({ "role": "user", "content": "bench write" }),
+        tags: vec![],
+        entities: vec![],
+    }
+}
+
+fn bench_append_event_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    if size.events > max_in_memory_events() {
+        return;
+    }
+    let store = InMemoryStore::new();
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_in_memory(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+
+    group.bench_with_input(
+        BenchmarkId::new("memory", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let event_id = format!("{}-w{}", event_prefix, counter);
+                let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                let event = build_write_event(&scope, event_id, ts);
+                store.append_event(event).unwrap();
+            })
+        },
+    );
+}
+
+fn bench_append_event_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("append_event_sqlite_{}", size.label()))
+    else {
+        return;
+    };
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_sqlite(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+
+    group.bench_with_input(
+        BenchmarkId::new("sqlite", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let event_id = format!("{}-w{}", event_prefix, counter);
+                let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                let event = build_write_event(&scope, event_id, ts);
+                store.append_event(event).unwrap();
+            })
+        },
+    );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
+}
+
+#[cfg(feature = "mysql")]
+fn bench_append_event_mysql(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some(dsn) = mysql_dsn() else {
+        return;
+    };
+    if size.events > max_mysql_events() {
+        return;
+    }
+    let store = MySqlStore::new(&dsn).unwrap();
+    reset_mysql_tables(&dsn);
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_store(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+
+    group.bench_with_input(
+        BenchmarkId::new("mysql", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let event_id = format!("{}-w{}", event_prefix, counter);
+                let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                let event = build_write_event(&scope, event_id, ts);
+                store.append_event(event).unwrap();
+            })
+        },
+    );
+}
+
+#[cfg(feature = "postgres")]
+fn bench_append_event_postgres(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some(dsn) = postgres_dsn() else {
+        return;
+    };
+    if size.events > max_postgres_events() {
+        return;
+    }
+    let store = PostgresStore::new(&dsn).unwrap();
+    reset_postgres_tables(&dsn);
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_store(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+
+    group.bench_with_input(
+        BenchmarkId::new("postgres", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let event_id = format!("{}-w{}", event_prefix, counter);
+                let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                let event = build_write_event(&scope, event_id, ts);
+                store.append_event(event).unwrap();
+            })
+        },
+    );
+}
+
+fn bench_append_events_bulk_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("append_events_bulk_sqlite_{}", size.label()))
+    else {
+        return;
+    };
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_sqlite(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+    let batch_size = bulk_event_batch_size();
+
+    group.bench_with_input(
+        BenchmarkId::new("sqlite", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                let mut batch = Vec::with_capacity(batch_size);
+                for _ in 0..batch_size {
+                    counter += 1;
+                    let event_id = format!("{}-w{}", event_prefix, counter);
+                    let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                    batch.push(build_write_event(&scope, event_id, ts));
+                }
+                store.append_events_bulk(&batch).unwrap();
+            })
+        },
+    );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
+}
+
+#[cfg(feature = "mysql")]
+fn bench_append_events_bulk_mysql(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some(dsn) = mysql_dsn() else {
+        return;
+    };
+    if size.events > max_mysql_events() {
+        return;
+    }
+    let store = MySqlStore::new(&dsn).unwrap();
+    reset_mysql_tables(&dsn);
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_store(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+    let batch_size = bulk_event_batch_size();
+
+    group.bench_with_input(
+        BenchmarkId::new("mysql", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                let mut batch = Vec::with_capacity(batch_size);
+                for _ in 0..batch_size {
+                    counter += 1;
+                    let event_id = format!("{}-w{}", event_prefix, counter);
+                    let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                    batch.push(build_write_event(&scope, event_id, ts));
+                }
+                store.append_events_bulk(&batch).unwrap();
+            })
+        },
+    );
+}
+
+#[cfg(feature = "postgres")]
+fn bench_append_events_bulk_postgres(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some(dsn) = postgres_dsn() else {
+        return;
+    };
+    if size.events > max_postgres_events() {
+        return;
+    }
+    let store = PostgresStore::new(&dsn).unwrap();
+    reset_postgres_tables(&dsn);
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let event_prefix = event_id_prefix(&scope);
+    seed_events_store(&store, size, &scope, &event_prefix);
+    let mut counter = size.events;
+    let base_ts = Utc::now();
+    let batch_size = bulk_event_batch_size();
+
+    group.bench_with_input(
+        BenchmarkId::new("postgres", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                let mut batch = Vec::with_capacity(batch_size);
+                for _ in 0..batch_size {
+                    counter += 1;
+                    let event_id = format!("{}-w{}", event_prefix, counter);
+                    let ts = base_ts + ChronoDuration::milliseconds(counter as i64);
+                    batch.push(build_write_event(&scope, event_id, ts));
+                }
+                store.append_events_bulk(&batch).unwrap();
+            })
+        },
+    );
+}
+
+fn bench_upsert_fact_in_memory(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let store = InMemoryStore::new();
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let mut counter = size.facts;
+
+    group.bench_with_input(
+        BenchmarkId::new("memory", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let fact = Fact {
+                    fact_id: format!("f{}", counter),
+                    fact_key: format!("bench.fact.{}", counter),
+                    value: json!({ "value": counter }),
+                    status: FactStatus::Active,
+                    validity: Validity::default(),
+                    confidence: 0.75,
+                    sources: vec![],
+                    scope_level: ScopeLevel::User,
+                    notes: String::new(),
+                };
+                store.upsert_fact(&scope, fact).unwrap();
+            })
+        },
+    );
+}
+
+fn bench_upsert_fact_sqlite(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some((store, cleanup)) =
+        sqlite_store_for_size(size, &format!("upsert_fact_sqlite_{}", size.label()))
+    else {
+        return;
+    };
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let mut counter = size.facts;
+
+    group.bench_with_input(
+        BenchmarkId::new("sqlite", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let fact = Fact {
+                    fact_id: format!("f{}", counter),
+                    fact_key: format!("bench.fact.{}", counter),
+                    value: json!({ "value": counter }),
+                    status: FactStatus::Active,
+                    validity: Validity::default(),
+                    confidence: 0.75,
+                    sources: vec![],
+                    scope_level: ScopeLevel::User,
+                    notes: String::new(),
+                };
+                store.upsert_fact(&scope, fact).unwrap();
+            })
+        },
+    );
+    drop(store);
+    cleanup_sqlite_file(cleanup);
+}
+
+#[cfg(feature = "mysql")]
+fn bench_upsert_fact_mysql(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some(dsn) = mysql_dsn() else {
+        return;
+    };
+    let store = MySqlStore::new(&dsn).unwrap();
+    reset_mysql_tables(&dsn);
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let mut counter = size.facts;
+
+    group.bench_with_input(
+        BenchmarkId::new("mysql", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let fact = Fact {
+                    fact_id: format!("f{}", counter),
+                    fact_key: format!("bench.fact.{}", counter),
+                    value: json!({ "value": counter }),
+                    status: FactStatus::Active,
+                    validity: Validity::default(),
+                    confidence: 0.75,
+                    sources: vec![],
+                    scope_level: ScopeLevel::User,
+                    notes: String::new(),
+                };
+                store.upsert_fact(&scope, fact).unwrap();
+            })
+        },
+    );
+}
+
+#[cfg(feature = "postgres")]
+fn bench_upsert_fact_postgres(group: &mut BenchmarkGroup<'_, WallTime>, size: DatasetSize) {
+    let Some(dsn) = postgres_dsn() else {
+        return;
+    };
+    let store = PostgresStore::new(&dsn).unwrap();
+    reset_postgres_tables(&dsn);
+    let scope = scope_for_size(size);
+    seed_store_common(&store, size, &scope);
+    let mut counter = size.facts;
+
+    group.bench_with_input(
+        BenchmarkId::new("postgres", size.label()),
+        &size,
+        |b, _| {
+            b.iter(|| {
+                counter += 1;
+                let fact = Fact {
+                    fact_id: format!("f{}", counter),
+                    fact_key: format!("bench.fact.{}", counter),
+                    value: json!({ "value": counter }),
+                    status: FactStatus::Active,
+                    validity: Validity::default(),
+                    confidence: 0.75,
+                    sources: vec![],
+                    scope_level: ScopeLevel::User,
+                    notes: String::new(),
+                };
+                store.upsert_fact(&scope, fact).unwrap();
+            })
+        },
+    );
+}
+
+fn load_bench_env() {
+    BENCH_ENV_LOADED.call_once(|| {
+        let Some(path) = bench_config_path() else {
+            return;
+        };
+        let Ok(contents) = fs::read_to_string(&path) else {
+            return;
+        };
+        for raw_line in contents.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() || env::var(key).is_ok() {
+                continue;
+            }
+            let mut value = value.trim().to_string();
+            if (value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\''))
+            {
+                value = value[1..value.len().saturating_sub(1)].to_string();
+            }
+            if !value.is_empty() {
+                unsafe {
+                    env::set_var(key, value);
+                }
+            }
+        }
+    });
+}
+
+fn bench_config_path() -> Option<PathBuf> {
+    if let Ok(value) = env::var("ENGRAM_BENCH_CONFIG") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    find_default_bench_config()
+}
+
+fn find_default_bench_config() -> Option<PathBuf> {
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = dir.join("bench/engram_bench.env");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn parse_usize_list_env(key: &str) -> Vec<usize> {
+    match env::var(key) {
+        Ok(value) => parse_usize_list(&value),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_usize_list(value: &str) -> Vec<usize> {
+    value
+        .split(',')
+        .filter_map(|raw| {
+            let cleaned = raw.trim().replace('_', "");
+            if cleaned.is_empty() {
+                return None;
+            }
+            cleaned.parse::<usize>().ok()
+        })
+        .collect()
+}
+
 fn is_extended() -> bool {
     matches!(
         env::var("ENGRAM_BENCH_EXTENDED").as_deref(),
@@ -1293,11 +2012,87 @@ fn max_in_memory_events() -> usize {
     MAX_IN_MEMORY_EVENTS
 }
 
+fn max_sqlite_events() -> usize {
+    if let Ok(value) = env::var("ENGRAM_BENCH_SQLITE_MAX_EVENTS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            return parsed;
+        }
+    }
+    MAX_SQLITE_EVENTS
+}
+
 fn bench_reset_db() -> bool {
     matches!(
         env::var("ENGRAM_BENCH_RESET_DB").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
     )
+}
+
+fn sqlite_mode() -> SqliteMode {
+    let Ok(value) = env::var("ENGRAM_BENCH_SQLITE_MODE") else {
+        return SqliteMode::Memory;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "file" => SqliteMode::File,
+        "auto" => SqliteMode::Auto,
+        _ => SqliteMode::Memory,
+    }
+}
+
+fn sqlite_store_for_size(size: DatasetSize, label: &str) -> Option<(SqliteStore, Option<PathBuf>)> {
+    let use_file = match sqlite_mode() {
+        SqliteMode::Memory => false,
+        SqliteMode::File => true,
+        SqliteMode::Auto => size.events > max_sqlite_events(),
+    };
+
+    if !use_file && size.events > max_sqlite_events() {
+        return None;
+    }
+
+    if use_file {
+        let (path, keep_file) = sqlite_file_path(label);
+        if bench_reset_db() {
+            let _ = fs::remove_file(&path);
+        }
+        let store = SqliteStore::new(path.clone()).unwrap();
+        let cleanup = if keep_file { None } else { Some(path) };
+        Some((store, cleanup))
+    } else {
+        Some((SqliteStore::new_in_memory().unwrap(), None))
+    }
+}
+
+fn sqlite_file_path(label: &str) -> (PathBuf, bool) {
+    if let Ok(value) = env::var("ENGRAM_BENCH_SQLITE_FILE") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return (PathBuf::from(trimmed), true);
+        }
+    }
+
+    let dir = env::var("ENGRAM_BENCH_SQLITE_DIR").unwrap_or_else(|_| "target/bench_sqlite".into());
+    let filename = format!("engram-{}.db", sanitize_filename(&unique_suffix(label)));
+    (PathBuf::from(dir).join(filename), false)
+}
+
+fn sanitize_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn cleanup_sqlite_file(path: Option<PathBuf>) {
+    if let Some(path) = path {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn sqlite_event_chunk() -> usize {
@@ -1307,6 +2102,15 @@ fn sqlite_event_chunk() -> usize {
         }
     }
     SQLITE_EVENT_CHUNK
+}
+
+fn bulk_event_batch_size() -> usize {
+    if let Ok(value) = env::var("ENGRAM_BENCH_BULK_EVENT_BATCH") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
+    500
 }
 
 fn unique_suffix(label: &str) -> String {
@@ -1345,9 +2149,6 @@ fn reset_mysql_tables(dsn: &str) {
     let _ = conn.exec_drop("SET FOREIGN_KEY_CHECKS = 1", ());
 }
 
-#[cfg(not(feature = "mysql"))]
-fn reset_mysql_tables(_dsn: &str) {}
-
 #[cfg(feature = "postgres")]
 fn reset_postgres_tables(dsn: &str) {
     if !bench_reset_db() {
@@ -1361,9 +2162,6 @@ fn reset_postgres_tables(dsn: &str) {
             .unwrap_or_else(|err| panic!("postgres truncate {table}: {err}"));
     }
 }
-
-#[cfg(not(feature = "postgres"))]
-fn reset_postgres_tables(_dsn: &str) {}
 
 #[cfg(feature = "postgres")]
 fn ensure_database_in_dsn(dsn: &str, database: &str) -> String {

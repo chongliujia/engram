@@ -110,13 +110,35 @@ ENGRAM_BENCH_EXTENDED=1 cargo bench -p engram-store
 ENGRAM_BENCH_EXTREME=1 cargo bench -p engram-store
 ```
 
+Include MySQL/Postgres:
+
+```bash
+cargo bench -p engram-store --features mysql,postgres
+```
+
+For large SQLite datasets, set `ENGRAM_BENCH_SQLITE_MODE=file` (or `auto`) to use a file-backed DB and avoid memory pressure.
+
 Tuning:
 
 - `ENGRAM_BENCH_INMEMORY_MAX_EVENTS` (default 300000)
+- `ENGRAM_BENCH_SQLITE_MAX_EVENTS` (default 1000000, in-memory SQLite cap)
+- `ENGRAM_BENCH_SQLITE_MODE` (`memory`, `file`, or `auto`, auto switches to file when events exceed `ENGRAM_BENCH_SQLITE_MAX_EVENTS`)
+- `ENGRAM_BENCH_SQLITE_DIR` (directory for file-mode SQLite DBs)
+- `ENGRAM_BENCH_SQLITE_FILE` (optional fixed SQLite file path)
 - `ENGRAM_BENCH_SQLITE_EVENT_CHUNK` (default 10000)
 - `ENGRAM_BENCH_MYSQL_DSN` / `ENGRAM_BENCH_POSTGRES_DSN`
 - `ENGRAM_BENCH_MYSQL_MAX_EVENTS` / `ENGRAM_BENCH_POSTGRES_MAX_EVENTS`
 - `ENGRAM_BENCH_RESET_DB` (set to `1` to truncate SQL tables before each dataset)
+- `ENGRAM_BENCH_EVENTS_SCALES` (comma-separated, extra event sizes for event-scale group)
+- `ENGRAM_BENCH_WRITE_EVENTS_SCALES` (comma-separated, extra event sizes for append benchmarks)
+- `ENGRAM_BENCH_WRITE_FACT_SCALES` (comma-separated, extra fact sizes for upsert benchmarks)
+- `ENGRAM_BENCH_BULK_EVENTS_SCALES` (comma-separated, extra event sizes for bulk append)
+- `ENGRAM_BENCH_BULK_EVENT_BATCH` (default 500)
+
+Unified bench config file:
+
+- Copy `bench/engram_bench.env.example` to `bench/engram_bench.env` and edit once.
+- Set `ENGRAM_BENCH_CONFIG=/path/to/engram_bench.env` to override the default path.
 
 Benchmark groups include:
 
@@ -127,6 +149,11 @@ Benchmark groups include:
 - `store_ops_list_episodes`
 - `store_ops_list_insights`
 - `store_ops_list_procedures`
+- `store_ops_append_event`
+- `store_ops_append_events_bulk`
+- `store_ops_upsert_fact`
+
+When you run with `--features mysql,postgres` and provide DSNs, the same groups are recorded for MySQL/Postgres alongside SQLite and in-memory.
 
 Generate the HTML summary report:
 

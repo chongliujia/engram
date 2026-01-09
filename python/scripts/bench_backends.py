@@ -7,8 +7,15 @@ import time
 import uuid
 from pathlib import Path
 import shutil
+import sys
 
 from engram import Memory
+from bench_config import (
+    env_int,
+    env_str,
+    find_config_arg,
+    load_bench_env,
+)
 
 
 def unique_suffix():
@@ -182,18 +189,33 @@ def write_html(results, output_path):
 
 
 def main():
+    config_arg = find_config_arg(sys.argv[1:])
+    load_bench_env(config_arg)
     repo_root = Path(__file__).resolve().parents[2]
     default_output = repo_root / "target" / "python_bench.json"
     default_html = repo_root / "target" / "python_bench.html"
     parser = argparse.ArgumentParser(description="Benchmark Engram Python backends.")
-    parser.add_argument("--events", type=int, default=2000, help="Events to insert per backend.")
     parser.add_argument(
-        "--iterations", type=int, default=30, help="Iterations for list/build."
+        "--config",
+        default=config_arg,
+        help="Optional bench config file path.",
+    )
+    parser.add_argument(
+        "--events",
+        type=int,
+        default=env_int("ENGRAM_BENCH_EVENTS", 2000),
+        help="Events to insert per backend.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=env_int("ENGRAM_BENCH_ITERATIONS", 30),
+        help="Iterations for list/build.",
     )
     parser.add_argument(
         "--list-limit",
         type=int,
-        default=None,
+        default=env_int("ENGRAM_BENCH_LIST_LIMIT", 0) or None,
         help="Optional limit for list_events.",
     )
     parser.add_argument("--output", default=str(default_output), help="Output JSON path.")
@@ -213,17 +235,17 @@ def main():
             run_backend("sqlite-file", mem, args.events, args.iterations, args.list_limit)
         )
 
-    mysql_dsn = os.getenv("ENGRAM_BENCH_MYSQL_DSN")
+    mysql_dsn = env_str("ENGRAM_BENCH_MYSQL_DSN")
     if mysql_dsn:
-        database = os.getenv("ENGRAM_BENCH_MYSQL_DB")
+        database = env_str("ENGRAM_BENCH_MYSQL_DB")
         mem = Memory(backend="mysql", dsn=mysql_dsn, database=database)
         results.append(
             run_backend("mysql", mem, args.events, args.iterations, args.list_limit)
         )
 
-    postgres_dsn = os.getenv("ENGRAM_BENCH_POSTGRES_DSN")
+    postgres_dsn = env_str("ENGRAM_BENCH_POSTGRES_DSN")
     if postgres_dsn:
-        database = os.getenv("ENGRAM_BENCH_POSTGRES_DB")
+        database = env_str("ENGRAM_BENCH_POSTGRES_DB")
         mem = Memory(backend="postgres", dsn=postgres_dsn, database=database)
         results.append(
             run_backend("postgres", mem, args.events, args.iterations, args.list_limit)

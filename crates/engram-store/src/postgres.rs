@@ -9,6 +9,7 @@ use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashSet;
 
 use crate::{
     EpisodeFilter, Event, EventKind, FactFilter, InsightFilter, StmState, Store, StoreError,
@@ -56,10 +57,106 @@ impl PostgresStore {
             .map_err(|err| StoreError::Storage(err.to_string()))?;
         f(&mut conn)
     }
+
+    pub fn append_events_bulk(&self, events: &[Event]) -> StoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let mut tx = conn.transaction().map_err(map_pg_err)?;
+            let stmt_event = tx
+                .prepare(
+                    "INSERT INTO events (
+                        event_id, tenant_id, user_id, agent_id, session_id, run_id,
+                        ts, kind, payload, tags, entities
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                )
+                .map_err(map_pg_err)?;
+            let stmt_tag = tx
+                .prepare(
+                    "INSERT INTO event_tags (
+                        tenant_id, user_id, agent_id, session_id, run_id, event_id, tag
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT DO NOTHING",
+                )
+                .map_err(map_pg_err)?;
+            let stmt_entity = tx
+                .prepare(
+                    "INSERT INTO event_entities (
+                        tenant_id, user_id, agent_id, session_id, run_id, event_id, entity
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT DO NOTHING",
+                )
+                .map_err(map_pg_err)?;
+
+            for event in events {
+                tx.execute(
+                    &stmt_event,
+                    &[
+                        &event.event_id,
+                        &event.scope.tenant_id,
+                        &event.scope.user_id,
+                        &event.scope.agent_id,
+                        &event.scope.session_id,
+                        &event.scope.run_id,
+                        &to_millis(event.ts),
+                        &event_kind_to_str(&event.kind),
+                        &encode_json(&event.payload)?,
+                        &encode_json(&event.tags)?,
+                        &encode_json(&event.entities)?,
+                    ],
+                )
+                .map_err(map_pg_err)?;
+
+                for tag in unique_values(&event.tags) {
+                    tx.execute(
+                        &stmt_tag,
+                        &[
+                            &event.scope.tenant_id,
+                            &event.scope.user_id,
+                            &event.scope.agent_id,
+                            &event.scope.session_id,
+                            &event.scope.run_id,
+                            &event.event_id,
+                            &tag,
+                        ],
+                    )
+                    .map_err(map_pg_err)?;
+                }
+                for entity in unique_values(&event.entities) {
+                    tx.execute(
+                        &stmt_entity,
+                        &[
+                            &event.scope.tenant_id,
+                            &event.scope.user_id,
+                            &event.scope.agent_id,
+                            &event.scope.session_id,
+                            &event.scope.run_id,
+                            &event.event_id,
+                            &entity,
+                        ],
+                    )
+                    .map_err(map_pg_err)?;
+                }
+            }
+
+            tx.commit().map_err(map_pg_err)?;
+            Ok(())
+        })
+    }
 }
 
 impl Store for PostgresStore {
     fn append_event(&self, event: Event) -> StoreResult<()> {
+        let Event {
+            event_id,
+            scope,
+            ts,
+            kind,
+            payload,
+            tags,
+            entities,
+        } = event;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO events (
@@ -67,20 +164,21 @@ impl Store for PostgresStore {
                     ts, kind, payload, tags, entities
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                 &[
-                    &event.event_id,
-                    &event.scope.tenant_id,
-                    &event.scope.user_id,
-                    &event.scope.agent_id,
-                    &event.scope.session_id,
-                    &event.scope.run_id,
-                    &to_millis(event.ts),
-                    &event_kind_to_str(&event.kind),
-                    &encode_json(&event.payload)?,
-                    &encode_json(&event.tags)?,
-                    &encode_json(&event.entities)?,
+                    &event_id,
+                    &scope.tenant_id,
+                    &scope.user_id,
+                    &scope.agent_id,
+                    &scope.session_id,
+                    &scope.run_id,
+                    &to_millis(ts),
+                    &event_kind_to_str(&kind),
+                    &encode_json(&payload)?,
+                    &encode_json(&tags)?,
+                    &encode_json(&entities)?,
                 ],
             )
             .map_err(map_pg_err)?;
+            insert_event_tags(conn, &scope, &event_id, &tags, &entities)?;
             Ok(())
         })
     }
@@ -392,6 +490,110 @@ impl Store for PostgresStore {
 
     fn list_episodes(&self, scope: &Scope, filter: EpisodeFilter) -> StoreResult<Vec<Episode>> {
         self.with_conn(|conn| {
+            let mut use_index = !filter.tags.is_empty() || !filter.entities.is_empty();
+            if !filter.tags.is_empty() && !episode_tags_present(conn, scope)? {
+                use_index = false;
+            }
+            if !filter.entities.is_empty() && !episode_entities_present(conn, scope)? {
+                use_index = false;
+            }
+
+            if use_index {
+                let mut params = PgParams::new();
+                let mut sql = String::from(
+                    "SELECT episode_id, start_ts, end_ts, summary, highlights, tags, entities,
+                            sources, compression_level, recency_score
+                     FROM episodes WHERE tenant_id = ",
+                );
+                sql.push_str(&params.add(scope.tenant_id.clone()));
+                sql.push_str(" AND user_id = ");
+                sql.push_str(&params.add(scope.user_id.clone()));
+                sql.push_str(" AND agent_id = ");
+                sql.push_str(&params.add(scope.agent_id.clone()));
+
+                if let Some(range) = &filter.time_range {
+                    if let Some(start) = range.start {
+                        sql.push_str(" AND start_ts >= ");
+                        sql.push_str(&params.add(to_millis(start)));
+                    }
+                    if let Some(end) = range.end {
+                        sql.push_str(" AND COALESCE(end_ts, start_ts) <= ");
+                        sql.push_str(&params.add(to_millis(end)));
+                    }
+                }
+
+                if !filter.tags.is_empty() {
+                    let placeholders = filter
+                        .tags
+                        .iter()
+                        .map(|tag| params.add(tag.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    sql.push_str(
+                        " AND EXISTS (
+                            SELECT 1 FROM episode_tags t
+                            WHERE t.tenant_id = episodes.tenant_id
+                              AND t.user_id = episodes.user_id
+                              AND t.agent_id = episodes.agent_id
+                              AND t.episode_id = episodes.episode_id
+                              AND t.tag IN (",
+                    );
+                    sql.push_str(&placeholders);
+                    sql.push_str("))");
+                }
+
+                if !filter.entities.is_empty() {
+                    let placeholders = filter
+                        .entities
+                        .iter()
+                        .map(|entity| params.add(entity.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    sql.push_str(
+                        " AND EXISTS (
+                            SELECT 1 FROM episode_entities e
+                            WHERE e.tenant_id = episodes.tenant_id
+                              AND e.user_id = episodes.user_id
+                              AND e.agent_id = episodes.agent_id
+                              AND e.episode_id = episodes.episode_id
+                              AND e.entity IN (",
+                    );
+                    sql.push_str(&placeholders);
+                    sql.push_str("))");
+                }
+
+                sql.push_str(" ORDER BY start_ts ASC, episode_id ASC");
+                if let Some(limit) = filter.limit {
+                    sql.push_str(" LIMIT ");
+                    sql.push_str(&params.add(limit as i64));
+                }
+
+                let rows = conn.query(&sql, &params.refs()).map_err(map_pg_err)?;
+                let mut episodes = Vec::new();
+                for row in rows {
+                    let highlights: String = row.get(4);
+                    let tags: String = row.get(5);
+                    let entities: String = row.get(6);
+                    let sources: String = row.get(7);
+                    let compression_level: String = row.get(8);
+                    episodes.push(Episode {
+                        episode_id: row.get(0),
+                        time_range: engram_types::TimeRange {
+                            start: from_millis(row.get(1)),
+                            end: row.get::<_, Option<i64>>(2).map(from_millis),
+                        },
+                        summary: row.get(3),
+                        highlights: decode_json(&highlights)?,
+                        tags: decode_json(&tags)?,
+                        entities: decode_json(&entities)?,
+                        sources: decode_json(&sources)?,
+                        compression_level: parse_compression_level(&compression_level)?,
+                        recency_score: row.get(9),
+                    });
+                }
+                return Ok(episodes);
+            }
+
             let mut params = PgParams::new();
             let mut sql = String::from(
                 "SELECT episode_id, start_ts, end_ts, summary, highlights, tags, entities,
@@ -474,6 +676,9 @@ impl Store for PostgresStore {
     }
 
     fn append_episode(&self, scope: &Scope, episode: Episode) -> StoreResult<()> {
+        let episode_id = episode.episode_id.clone();
+        let tags = episode.tags.clone();
+        let entities = episode.entities.clone();
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO episodes (
@@ -497,6 +702,7 @@ impl Store for PostgresStore {
                 ],
             )
             .map_err(map_pg_err)?;
+            insert_episode_tags(conn, scope, &episode_id, &tags, &entities)?;
             Ok(())
         })
     }
@@ -773,6 +979,51 @@ fn ensure_schema(conn: &mut Client) -> StoreResult<()> {
         );
         CREATE INDEX IF NOT EXISTS events_scope_ts
             ON events (tenant_id, user_id, agent_id, session_id, run_id, ts);
+        CREATE TABLE IF NOT EXISTS event_tags (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            PRIMARY KEY (
+                tenant_id,
+                user_id,
+                agent_id,
+                session_id,
+                run_id,
+                event_id,
+                tag
+            )
+        );
+        CREATE INDEX IF NOT EXISTS event_tags_scope_tag
+            ON event_tags (tenant_id, user_id, agent_id, session_id, run_id, tag);
+        CREATE INDEX IF NOT EXISTS event_tags_scope_event
+            ON event_tags (tenant_id, user_id, agent_id, session_id, run_id, event_id);
+
+        CREATE TABLE IF NOT EXISTS event_entities (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            entity TEXT NOT NULL,
+            PRIMARY KEY (
+                tenant_id,
+                user_id,
+                agent_id,
+                session_id,
+                run_id,
+                event_id,
+                entity
+            )
+        );
+        CREATE INDEX IF NOT EXISTS event_entities_scope_entity
+            ON event_entities (tenant_id, user_id, agent_id, session_id, run_id, entity);
+        CREATE INDEX IF NOT EXISTS event_entities_scope_event
+            ON event_entities (tenant_id, user_id, agent_id, session_id, run_id, event_id);
 
         CREATE TABLE IF NOT EXISTS wm_state (
             tenant_id TEXT NOT NULL,
@@ -833,6 +1084,31 @@ fn ensure_schema(conn: &mut Client) -> StoreResult<()> {
         );
         CREATE INDEX IF NOT EXISTS episodes_scope_start
             ON episodes (tenant_id, user_id, agent_id, start_ts);
+        CREATE TABLE IF NOT EXISTS episode_tags (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            episode_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, episode_id, tag)
+        );
+        CREATE INDEX IF NOT EXISTS episode_tags_scope_tag
+            ON episode_tags (tenant_id, user_id, agent_id, tag);
+        CREATE INDEX IF NOT EXISTS episode_tags_scope_episode
+            ON episode_tags (tenant_id, user_id, agent_id, episode_id);
+
+        CREATE TABLE IF NOT EXISTS episode_entities (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            episode_id TEXT NOT NULL,
+            entity TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, episode_id, entity)
+        );
+        CREATE INDEX IF NOT EXISTS episode_entities_scope_entity
+            ON episode_entities (tenant_id, user_id, agent_id, entity);
+        CREATE INDEX IF NOT EXISTS episode_entities_scope_episode
+            ON episode_entities (tenant_id, user_id, agent_id, episode_id);
 
         CREATE TABLE IF NOT EXISTS procedures (
             tenant_id TEXT NOT NULL,
@@ -934,6 +1210,169 @@ fn from_millis(millis: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(millis)
         .single()
         .unwrap_or_else(|| Utc.timestamp_millis_opt(0).single().unwrap())
+}
+
+fn unique_values(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+fn insert_event_tags(
+    conn: &mut Client,
+    scope: &Scope,
+    event_id: &str,
+    tags: &[String],
+    entities: &[String],
+) -> StoreResult<()> {
+    if tags.is_empty() && entities.is_empty() {
+        return Ok(());
+    }
+    let tags = unique_values(tags);
+    let entities = unique_values(entities);
+
+    if !tags.is_empty() {
+        let stmt = conn
+            .prepare(
+                "INSERT INTO event_tags (
+                    tenant_id, user_id, agent_id, session_id, run_id, event_id, tag
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT DO NOTHING",
+            )
+            .map_err(map_pg_err)?;
+        for tag in tags {
+            conn.execute(
+                &stmt,
+                &[
+                    &scope.tenant_id,
+                    &scope.user_id,
+                    &scope.agent_id,
+                    &scope.session_id,
+                    &scope.run_id,
+                    &event_id,
+                    &tag,
+                ],
+            )
+            .map_err(map_pg_err)?;
+        }
+    }
+
+    if !entities.is_empty() {
+        let stmt = conn
+            .prepare(
+                "INSERT INTO event_entities (
+                    tenant_id, user_id, agent_id, session_id, run_id, event_id, entity
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT DO NOTHING",
+            )
+            .map_err(map_pg_err)?;
+        for entity in entities {
+            conn.execute(
+                &stmt,
+                &[
+                    &scope.tenant_id,
+                    &scope.user_id,
+                    &scope.agent_id,
+                    &scope.session_id,
+                    &scope.run_id,
+                    &event_id,
+                    &entity,
+                ],
+            )
+            .map_err(map_pg_err)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_episode_tags(
+    conn: &mut Client,
+    scope: &Scope,
+    episode_id: &str,
+    tags: &[String],
+    entities: &[String],
+) -> StoreResult<()> {
+    if tags.is_empty() && entities.is_empty() {
+        return Ok(());
+    }
+    let tags = unique_values(tags);
+    let entities = unique_values(entities);
+
+    if !tags.is_empty() {
+        let stmt = conn
+            .prepare(
+                "INSERT INTO episode_tags (
+                    tenant_id, user_id, agent_id, episode_id, tag
+                ) VALUES ($1,$2,$3,$4,$5)
+                ON CONFLICT DO NOTHING",
+            )
+            .map_err(map_pg_err)?;
+        for tag in tags {
+            conn.execute(
+                &stmt,
+                &[
+                    &scope.tenant_id,
+                    &scope.user_id,
+                    &scope.agent_id,
+                    &episode_id,
+                    &tag,
+                ],
+            )
+            .map_err(map_pg_err)?;
+        }
+    }
+
+    if !entities.is_empty() {
+        let stmt = conn
+            .prepare(
+                "INSERT INTO episode_entities (
+                    tenant_id, user_id, agent_id, episode_id, entity
+                ) VALUES ($1,$2,$3,$4,$5)
+                ON CONFLICT DO NOTHING",
+            )
+            .map_err(map_pg_err)?;
+        for entity in entities {
+            conn.execute(
+                &stmt,
+                &[
+                    &scope.tenant_id,
+                    &scope.user_id,
+                    &scope.agent_id,
+                    &episode_id,
+                    &entity,
+                ],
+            )
+            .map_err(map_pg_err)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn episode_tags_present(conn: &mut Client, scope: &Scope) -> StoreResult<bool> {
+    let row = conn
+        .query_opt(
+            "SELECT 1 FROM episode_tags WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 LIMIT 1",
+            &[&scope.tenant_id, &scope.user_id, &scope.agent_id],
+        )
+        .map_err(map_pg_err)?;
+    Ok(row.is_some())
+}
+
+fn episode_entities_present(conn: &mut Client, scope: &Scope) -> StoreResult<bool> {
+    let row = conn
+        .query_opt(
+            "SELECT 1 FROM episode_entities WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 LIMIT 1",
+            &[&scope.tenant_id, &scope.user_id, &scope.agent_id],
+        )
+        .map_err(map_pg_err)?;
+    Ok(row.is_some())
 }
 
 fn event_kind_to_str(kind: &EventKind) -> &'static str {

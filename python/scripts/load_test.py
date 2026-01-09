@@ -8,8 +8,16 @@ import threading
 import time
 import uuid
 from pathlib import Path
+import sys
 
 from engram import Memory
+from bench_config import (
+    env_float,
+    env_int,
+    env_str,
+    find_config_arg,
+    load_bench_env,
+)
 
 
 def unique_suffix():
@@ -163,9 +171,9 @@ def resolve_backends(args):
         backends.append(args.backend)
         return backends
     backends.extend(["sqlite-memory", "sqlite-file"])
-    if os.getenv("ENGRAM_LOAD_MYSQL_DSN"):
+    if env_str("ENGRAM_LOAD_MYSQL_DSN"):
         backends.append("mysql")
-    if os.getenv("ENGRAM_LOAD_POSTGRES_DSN"):
+    if env_str("ENGRAM_LOAD_POSTGRES_DSN"):
         backends.append("postgres")
     return backends
 
@@ -179,31 +187,86 @@ def build_memory_for_backend(name, args):
         tmpdir = tempfile.mkdtemp()
         return Memory(path=os.path.join(tmpdir, "engram.db"))
     if name == "mysql":
-        dsn = os.getenv("ENGRAM_LOAD_MYSQL_DSN")
-        database = os.getenv("ENGRAM_LOAD_MYSQL_DB")
+        dsn = env_str("ENGRAM_LOAD_MYSQL_DSN")
+        database = env_str("ENGRAM_LOAD_MYSQL_DB")
         return Memory(backend="mysql", dsn=dsn, database=database)
     if name == "postgres":
-        dsn = os.getenv("ENGRAM_LOAD_POSTGRES_DSN")
-        database = os.getenv("ENGRAM_LOAD_POSTGRES_DB")
+        dsn = env_str("ENGRAM_LOAD_POSTGRES_DSN")
+        database = env_str("ENGRAM_LOAD_POSTGRES_DB")
         return Memory(backend="postgres", dsn=dsn, database=database)
     raise ValueError(f"unknown backend: {name}")
 
 
 def main():
+    config_arg = find_config_arg(sys.argv[1:])
+    load_bench_env(config_arg)
     repo_root = Path(__file__).resolve().parents[2]
     default_output = repo_root / "target" / "python_load.json"
 
     parser = argparse.ArgumentParser(description="Concurrent load test for Engram backends.")
-    parser.add_argument("--backend", default=None, help="Optional single backend to test.")
-    parser.add_argument("--duration", type=int, default=60, help="Test duration (seconds).")
-    parser.add_argument("--concurrency", type=int, default=8, help="Worker threads.")
-    parser.add_argument("--seed-events", type=int, default=2000, help="Seed events per backend.")
-    parser.add_argument("--list-limit", type=int, default=50, help="list_events limit.")
-    parser.add_argument("--append-ratio", type=float, default=0.3, help="Append ratio.")
-    parser.add_argument("--list-ratio", type=float, default=0.4, help="List ratio.")
-    parser.add_argument("--build-ratio", type=float, default=0.3, help="Build ratio.")
-    parser.add_argument("--max-samples", type=int, default=10000, help="Max latency samples.")
-    parser.add_argument("--sqlite-path", default=None, help="Optional SQLite file path.")
+    parser.add_argument(
+        "--config",
+        default=config_arg,
+        help="Optional bench config file path.",
+    )
+    parser.add_argument(
+        "--backend",
+        default=env_str("ENGRAM_LOAD_BACKEND"),
+        help="Optional single backend to test.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=env_int("ENGRAM_LOAD_DURATION", 60),
+        help="Test duration (seconds).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=env_int("ENGRAM_LOAD_CONCURRENCY", 8),
+        help="Worker threads.",
+    )
+    parser.add_argument(
+        "--seed-events",
+        type=int,
+        default=env_int("ENGRAM_LOAD_SEED_EVENTS", 2000),
+        help="Seed events per backend.",
+    )
+    parser.add_argument(
+        "--list-limit",
+        type=int,
+        default=env_int("ENGRAM_LOAD_LIST_LIMIT", 50),
+        help="list_events limit.",
+    )
+    parser.add_argument(
+        "--append-ratio",
+        type=float,
+        default=env_float("ENGRAM_LOAD_APPEND_RATIO", 0.3),
+        help="Append ratio.",
+    )
+    parser.add_argument(
+        "--list-ratio",
+        type=float,
+        default=env_float("ENGRAM_LOAD_LIST_RATIO", 0.4),
+        help="List ratio.",
+    )
+    parser.add_argument(
+        "--build-ratio",
+        type=float,
+        default=env_float("ENGRAM_LOAD_BUILD_RATIO", 0.3),
+        help="Build ratio.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=env_int("ENGRAM_LOAD_MAX_SAMPLES", 10000),
+        help="Max latency samples.",
+    )
+    parser.add_argument(
+        "--sqlite-path",
+        default=env_str("ENGRAM_LOAD_SQLITE_PATH"),
+        help="Optional SQLite file path.",
+    )
     parser.add_argument("--output", default=str(default_output), help="Output JSON path.")
     args = parser.parse_args()
 

@@ -7,6 +7,7 @@ use mysql::prelude::Queryable;
 use mysql::{from_row, Opts, OptsBuilder, Params, Pool, PooledConn, Value as MyValue};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashSet;
 
 use crate::{
     EpisodeFilter, Event, EventKind, FactFilter, InsightFilter, StmState, Store, StoreError,
@@ -58,11 +59,70 @@ impl MySqlStore {
         let mut conn = self.pool.get_conn().map_err(map_mysql_err)?;
         f(&mut conn)
     }
+
+    pub fn append_events_bulk(&self, events: &[Event]) -> StoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            conn.exec_drop("START TRANSACTION", ())
+                .map_err(map_mysql_err)?;
+            let result = (|| {
+                let mut params = Vec::with_capacity(events.len());
+                for event in events {
+                    params.push(Params::Positional(vec![
+                        MyValue::from(event.event_id.clone()),
+                        MyValue::from(event.scope.tenant_id.clone()),
+                        MyValue::from(event.scope.user_id.clone()),
+                        MyValue::from(event.scope.agent_id.clone()),
+                        MyValue::from(event.scope.session_id.clone()),
+                        MyValue::from(event.scope.run_id.clone()),
+                        MyValue::from(to_millis(event.ts)),
+                        MyValue::from(event_kind_to_str(&event.kind)),
+                        MyValue::from(encode_json(&event.payload)?),
+                        MyValue::from(encode_json(&event.tags)?),
+                        MyValue::from(encode_json(&event.entities)?),
+                    ]));
+                }
+
+                conn.exec_batch(
+                    "INSERT INTO events (
+                        event_id, tenant_id, user_id, agent_id, session_id, run_id,
+                        ts, kind, payload, tags, entities
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params,
+                )
+                .map_err(map_mysql_err)?;
+
+                insert_event_tags_bulk(conn, events)?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => {
+                    conn.exec_drop("COMMIT", ()).map_err(map_mysql_err)?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = conn.exec_drop("ROLLBACK", ());
+                    Err(err)
+                }
+            }
+        })
+    }
 }
 
 impl Store for MySqlStore {
     fn append_event(&self, event: Event) -> StoreResult<()> {
-        let scope = event.scope;
+        let Event {
+            event_id,
+            scope,
+            ts,
+            kind,
+            payload,
+            tags,
+            entities,
+        } = event;
         self.with_conn(|conn| {
             conn.exec_drop(
                 "INSERT INTO events (
@@ -70,20 +130,21 @@ impl Store for MySqlStore {
                     ts, kind, payload, tags, entities
                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    event.event_id,
-                    scope.tenant_id,
-                    scope.user_id,
-                    scope.agent_id,
-                    scope.session_id,
-                    scope.run_id,
-                    to_millis(event.ts),
-                    event_kind_to_str(&event.kind),
-                    encode_json(&event.payload)?,
-                    encode_json(&event.tags)?,
-                    encode_json(&event.entities)?,
+                    event_id.clone(),
+                    scope.tenant_id.clone(),
+                    scope.user_id.clone(),
+                    scope.agent_id.clone(),
+                    scope.session_id.clone(),
+                    scope.run_id.clone(),
+                    to_millis(ts),
+                    event_kind_to_str(&kind),
+                    encode_json(&payload)?,
+                    encode_json(&tags)?,
+                    encode_json(&entities)?,
                 ),
             )
             .map_err(map_mysql_err)?;
+            insert_event_tags(conn, &scope, &event_id, &tags, &entities)?;
             Ok(())
         })
     }
@@ -412,6 +473,119 @@ impl Store for MySqlStore {
 
     fn list_episodes(&self, scope: &Scope, filter: EpisodeFilter) -> StoreResult<Vec<Episode>> {
         self.with_conn(|conn| {
+            let mut use_index = !filter.tags.is_empty() || !filter.entities.is_empty();
+            if !filter.tags.is_empty() && !episode_tags_present(conn, scope)? {
+                use_index = false;
+            }
+            if !filter.entities.is_empty() && !episode_entities_present(conn, scope)? {
+                use_index = false;
+            }
+
+            if use_index {
+                let mut sql = String::from(
+                    "SELECT episode_id, start_ts, end_ts, summary, highlights, tags, entities,
+                            sources, compression_level, recency_score
+                     FROM episodes WHERE tenant_id = ? AND user_id = ? AND agent_id = ?",
+                );
+                let mut params = scope_params_ltm(scope);
+
+                if let Some(range) = &filter.time_range {
+                    if let Some(start) = range.start {
+                        sql.push_str(" AND start_ts >= ?");
+                        params.push(MyValue::from(to_millis(start)));
+                    }
+                    if let Some(end) = range.end {
+                        sql.push_str(" AND COALESCE(end_ts, start_ts) <= ?");
+                        params.push(MyValue::from(to_millis(end)));
+                    }
+                }
+
+                if !filter.tags.is_empty() {
+                    sql.push_str(
+                        " AND EXISTS (
+                            SELECT 1 FROM episode_tags t
+                            WHERE t.tenant_id = episodes.tenant_id
+                              AND t.user_id = episodes.user_id
+                              AND t.agent_id = episodes.agent_id
+                              AND t.episode_id = episodes.episode_id
+                              AND t.tag IN (",
+                    );
+                    sql.push_str(&sql_placeholders(filter.tags.len()));
+                    sql.push_str("))");
+                    for tag in &filter.tags {
+                        params.push(MyValue::from(tag.clone()));
+                    }
+                }
+
+                if !filter.entities.is_empty() {
+                    sql.push_str(
+                        " AND EXISTS (
+                            SELECT 1 FROM episode_entities e
+                            WHERE e.tenant_id = episodes.tenant_id
+                              AND e.user_id = episodes.user_id
+                              AND e.agent_id = episodes.agent_id
+                              AND e.episode_id = episodes.episode_id
+                              AND e.entity IN (",
+                    );
+                    sql.push_str(&sql_placeholders(filter.entities.len()));
+                    sql.push_str("))");
+                    for entity in &filter.entities {
+                        params.push(MyValue::from(entity.clone()));
+                    }
+                }
+
+                sql.push_str(" ORDER BY start_ts ASC, episode_id ASC");
+                if let Some(limit) = filter.limit {
+                    sql.push_str(" LIMIT ?");
+                    params.push(MyValue::from(limit as i64));
+                }
+
+                let rows: Vec<mysql::Row> =
+                    conn.exec(sql, Params::Positional(params))
+                        .map_err(map_mysql_err)?;
+                let mut episodes = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let (
+                        episode_id,
+                        start_ts,
+                        end_ts,
+                        summary,
+                        highlights,
+                        tags,
+                        entities,
+                        sources,
+                        compression_level,
+                        recency_score,
+                    ): (
+                        String,
+                        i64,
+                        Option<i64>,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        Option<f64>,
+                    ) = from_row(row);
+                    episodes.push(Episode {
+                        episode_id,
+                        time_range: engram_types::TimeRange {
+                            start: from_millis(start_ts),
+                            end: end_ts.map(from_millis),
+                        },
+                        summary,
+                        highlights: decode_json(&highlights)?,
+                        tags: decode_json(&tags)?,
+                        entities: decode_json(&entities)?,
+                        sources: decode_json(&sources)?,
+                        compression_level: parse_compression_level(&compression_level)?,
+                        recency_score,
+                    });
+                }
+                return Ok(episodes);
+            }
+
             let mut sql = String::from(
                 "SELECT episode_id, start_ts, end_ts, summary, highlights, tags, entities,
                         sources, compression_level, recency_score
@@ -522,6 +696,9 @@ impl Store for MySqlStore {
     }
 
     fn append_episode(&self, scope: &Scope, episode: Episode) -> StoreResult<()> {
+        let episode_id = episode.episode_id.clone();
+        let tags = episode.tags.clone();
+        let entities = episode.entities.clone();
         self.with_conn(|conn| {
             conn.exec_drop(
                 "INSERT INTO episodes (
@@ -545,6 +722,7 @@ impl Store for MySqlStore {
                 ]),
             )
             .map_err(map_mysql_err)?;
+            insert_episode_tags(conn, scope, &episode_id, &tags, &entities)?;
             Ok(())
         })
     }
@@ -812,6 +990,30 @@ fn ensure_schema(conn: &mut PooledConn) -> StoreResult<()> {
         ) ENGINE=InnoDB",
         "CREATE INDEX events_scope_ts
             ON events (tenant_id, user_id, agent_id, session_id, run_id, ts)",
+        "CREATE TABLE IF NOT EXISTS event_tags (
+            tenant_id VARCHAR(96) NOT NULL,
+            user_id VARCHAR(96) NOT NULL,
+            agent_id VARCHAR(96) NOT NULL,
+            session_id VARCHAR(96) NOT NULL,
+            run_id VARCHAR(96) NOT NULL,
+            event_id VARCHAR(96) NOT NULL,
+            tag VARCHAR(64) NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, session_id, run_id, event_id, tag)
+        ) ENGINE=InnoDB",
+        "CREATE INDEX event_tags_scope_tag
+            ON event_tags (tenant_id, user_id, agent_id, session_id, run_id, tag)",
+        "CREATE TABLE IF NOT EXISTS event_entities (
+            tenant_id VARCHAR(96) NOT NULL,
+            user_id VARCHAR(96) NOT NULL,
+            agent_id VARCHAR(96) NOT NULL,
+            session_id VARCHAR(96) NOT NULL,
+            run_id VARCHAR(96) NOT NULL,
+            event_id VARCHAR(96) NOT NULL,
+            entity VARCHAR(64) NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, session_id, run_id, event_id, entity)
+        ) ENGINE=InnoDB",
+        "CREATE INDEX event_entities_scope_entity
+            ON event_entities (tenant_id, user_id, agent_id, session_id, run_id, entity)",
         "CREATE TABLE IF NOT EXISTS wm_state (
             tenant_id VARCHAR(96) NOT NULL,
             user_id VARCHAR(96) NOT NULL,
@@ -868,6 +1070,26 @@ fn ensure_schema(conn: &mut PooledConn) -> StoreResult<()> {
         ) ENGINE=InnoDB",
         "CREATE INDEX episodes_scope_start
             ON episodes (tenant_id, user_id, agent_id, start_ts)",
+        "CREATE TABLE IF NOT EXISTS episode_tags (
+            tenant_id VARCHAR(96) NOT NULL,
+            user_id VARCHAR(96) NOT NULL,
+            agent_id VARCHAR(96) NOT NULL,
+            episode_id VARCHAR(96) NOT NULL,
+            tag VARCHAR(64) NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, episode_id, tag)
+        ) ENGINE=InnoDB",
+        "CREATE INDEX episode_tags_scope_tag
+            ON episode_tags (tenant_id, user_id, agent_id, tag)",
+        "CREATE TABLE IF NOT EXISTS episode_entities (
+            tenant_id VARCHAR(96) NOT NULL,
+            user_id VARCHAR(96) NOT NULL,
+            agent_id VARCHAR(96) NOT NULL,
+            episode_id VARCHAR(96) NOT NULL,
+            entity VARCHAR(64) NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, episode_id, entity)
+        ) ENGINE=InnoDB",
+        "CREATE INDEX episode_entities_scope_entity
+            ON episode_entities (tenant_id, user_id, agent_id, entity)",
         "CREATE TABLE IF NOT EXISTS procedures (
             tenant_id VARCHAR(96) NOT NULL,
             user_id VARCHAR(96) NOT NULL,
@@ -976,6 +1198,198 @@ fn scope_params_ltm(scope: &Scope) -> Vec<MyValue> {
         MyValue::from(scope.user_id.clone()),
         MyValue::from(scope.agent_id.clone()),
     ]
+}
+
+fn sql_placeholders(count: usize) -> String {
+    std::iter::repeat("?")
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unique_values(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            result.push(value.clone());
+        }
+    }
+    result
+}
+
+fn insert_event_tags(
+    conn: &mut PooledConn,
+    scope: &Scope,
+    event_id: &str,
+    tags: &[String],
+    entities: &[String],
+) -> StoreResult<()> {
+    let tags = unique_values(tags);
+    if !tags.is_empty() {
+        let mut params = Vec::with_capacity(tags.len());
+        for tag in tags {
+            params.push(Params::Positional(vec![
+                MyValue::from(scope.tenant_id.clone()),
+                MyValue::from(scope.user_id.clone()),
+                MyValue::from(scope.agent_id.clone()),
+                MyValue::from(scope.session_id.clone()),
+                MyValue::from(scope.run_id.clone()),
+                MyValue::from(event_id.to_string()),
+                MyValue::from(tag),
+            ]));
+        }
+        conn.exec_batch(
+            "INSERT IGNORE INTO event_tags (
+                tenant_id, user_id, agent_id, session_id, run_id, event_id, tag
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params,
+        )
+        .map_err(map_mysql_err)?;
+    }
+
+    let entities = unique_values(entities);
+    if !entities.is_empty() {
+        let mut params = Vec::with_capacity(entities.len());
+        for entity in entities {
+            params.push(Params::Positional(vec![
+                MyValue::from(scope.tenant_id.clone()),
+                MyValue::from(scope.user_id.clone()),
+                MyValue::from(scope.agent_id.clone()),
+                MyValue::from(scope.session_id.clone()),
+                MyValue::from(scope.run_id.clone()),
+                MyValue::from(event_id.to_string()),
+                MyValue::from(entity),
+            ]));
+        }
+        conn.exec_batch(
+            "INSERT IGNORE INTO event_entities (
+                tenant_id, user_id, agent_id, session_id, run_id, event_id, entity
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params,
+        )
+        .map_err(map_mysql_err)?;
+    }
+    Ok(())
+}
+
+fn insert_event_tags_bulk(conn: &mut PooledConn, events: &[Event]) -> StoreResult<()> {
+    let mut tag_params = Vec::new();
+    let mut entity_params = Vec::new();
+    for event in events {
+        for tag in unique_values(&event.tags) {
+            tag_params.push(Params::Positional(vec![
+                MyValue::from(event.scope.tenant_id.clone()),
+                MyValue::from(event.scope.user_id.clone()),
+                MyValue::from(event.scope.agent_id.clone()),
+                MyValue::from(event.scope.session_id.clone()),
+                MyValue::from(event.scope.run_id.clone()),
+                MyValue::from(event.event_id.clone()),
+                MyValue::from(tag),
+            ]));
+        }
+        for entity in unique_values(&event.entities) {
+            entity_params.push(Params::Positional(vec![
+                MyValue::from(event.scope.tenant_id.clone()),
+                MyValue::from(event.scope.user_id.clone()),
+                MyValue::from(event.scope.agent_id.clone()),
+                MyValue::from(event.scope.session_id.clone()),
+                MyValue::from(event.scope.run_id.clone()),
+                MyValue::from(event.event_id.clone()),
+                MyValue::from(entity),
+            ]));
+        }
+    }
+    if !tag_params.is_empty() {
+        conn.exec_batch(
+            "INSERT IGNORE INTO event_tags (
+                tenant_id, user_id, agent_id, session_id, run_id, event_id, tag
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            tag_params,
+        )
+        .map_err(map_mysql_err)?;
+    }
+    if !entity_params.is_empty() {
+        conn.exec_batch(
+            "INSERT IGNORE INTO event_entities (
+                tenant_id, user_id, agent_id, session_id, run_id, event_id, entity
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            entity_params,
+        )
+        .map_err(map_mysql_err)?;
+    }
+    Ok(())
+}
+
+fn insert_episode_tags(
+    conn: &mut PooledConn,
+    scope: &Scope,
+    episode_id: &str,
+    tags: &[String],
+    entities: &[String],
+) -> StoreResult<()> {
+    let tags = unique_values(tags);
+    if !tags.is_empty() {
+        let mut params = Vec::with_capacity(tags.len());
+        for tag in tags {
+            params.push(Params::Positional(vec![
+                MyValue::from(scope.tenant_id.clone()),
+                MyValue::from(scope.user_id.clone()),
+                MyValue::from(scope.agent_id.clone()),
+                MyValue::from(episode_id.to_string()),
+                MyValue::from(tag),
+            ]));
+        }
+        conn.exec_batch(
+            "INSERT IGNORE INTO episode_tags (
+                tenant_id, user_id, agent_id, episode_id, tag
+             ) VALUES (?, ?, ?, ?, ?)",
+            params,
+        )
+        .map_err(map_mysql_err)?;
+    }
+
+    let entities = unique_values(entities);
+    if !entities.is_empty() {
+        let mut params = Vec::with_capacity(entities.len());
+        for entity in entities {
+            params.push(Params::Positional(vec![
+                MyValue::from(scope.tenant_id.clone()),
+                MyValue::from(scope.user_id.clone()),
+                MyValue::from(scope.agent_id.clone()),
+                MyValue::from(episode_id.to_string()),
+                MyValue::from(entity),
+            ]));
+        }
+        conn.exec_batch(
+            "INSERT IGNORE INTO episode_entities (
+                tenant_id, user_id, agent_id, episode_id, entity
+             ) VALUES (?, ?, ?, ?, ?)",
+            params,
+        )
+        .map_err(map_mysql_err)?;
+    }
+    Ok(())
+}
+
+fn episode_tags_present(conn: &mut PooledConn, scope: &Scope) -> StoreResult<bool> {
+    let row: Option<(u8,)> = conn
+        .exec_first(
+            "SELECT 1 FROM episode_tags WHERE tenant_id = ? AND user_id = ? AND agent_id = ? LIMIT 1",
+            Params::Positional(scope_params_ltm(scope)),
+        )
+        .map_err(map_mysql_err)?;
+    Ok(row.is_some())
+}
+
+fn episode_entities_present(conn: &mut PooledConn, scope: &Scope) -> StoreResult<bool> {
+    let row: Option<(u8,)> = conn
+        .exec_first(
+            "SELECT 1 FROM episode_entities WHERE tenant_id = ? AND user_id = ? AND agent_id = ? LIMIT 1",
+            Params::Positional(scope_params_ltm(scope)),
+        )
+        .map_err(map_mysql_err)?;
+    Ok(row.is_some())
 }
 
 fn event_kind_to_str(kind: &EventKind) -> &'static str {
