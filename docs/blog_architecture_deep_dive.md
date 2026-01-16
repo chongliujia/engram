@@ -49,8 +49,8 @@ graph TD
     end
 
     subgraph "Storage Layer"
-        Pool[Connection Pool (r2d2)]
-        DB[(SQLite / Postgres)]
+        Pool["Connection Pool (r2d2)"]
+        DB[("SQLite / Postgres")]
     end
 
     User -->|await build_memory_packet()| SDK
