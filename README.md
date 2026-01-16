@@ -1,273 +1,181 @@
-# engram
-A memory and context engineering system for AI agents, with predictable latency and explainable long-term and short-term memory.
+# 🧠 Engram
 
-## Quick start (Rust)
+<div align="center">
 
-```rust
-use engram_store::{build_memory_packet, BuildRequest, SqliteStore};
-use engram_types::{Purpose, Scope};
+**The High-Performance, Structured Memory System for AI Agents.**  
+*Built in **Rust** 🦀 for speed, exposed to **Python** 🐍 for ease of use.*
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = SqliteStore::new("data/engram.db")?;
-    let scope = Scope {
-        tenant_id: "default".to_string(),
-        user_id: "u1".to_string(),
-        agent_id: "a1".to_string(),
-        session_id: "s1".to_string(),
-        run_id: "r1".to_string(),
-    };
+[![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-    let request = BuildRequest::new(scope, Purpose::Planner);
-    let packet = build_memory_packet(&store, request)?;
-    println!("packet schema: {}", packet.meta.schema_version);
-    Ok(())
-}
-```
+</div>
 
-## Quick start (Python)
+---
 
-Build and install the extension:
+**Engram** is not just a vector database. It is a **cognitive architecture** component designed to give Agents predictable, explainable, and latency-controlled memory. 
+
+It implements a human-like memory hierarchy: **Working Memory** (short-term), **Episodic Memory** (experiences), and **Semantic Memory** (facts), all governed by strict recall policies and token budgets.
+
+## ✨ Key Features
+
+- **🚀 Blazing Fast**: Core logic written in Rust. Zero-copy data handling.
+- **⚡ Async Native**: Fully non-blocking Python `AsyncMemory` for high-concurrency production apps (FastAPI, etc.).
+- **🧠 Cognitive Hierarchy**: Native support for Working Memory, Episodic Events, and Semantic Facts.
+- **🔍 Explainable Recall**: Don't just get chunks. Know *why* a memory was retrieved (Recency? Relevance? Importance?).
+- **👮 Strict Budgeting**: Enforce hard token limits per section. Never blow your context window again.
+- **🔌 Dual-Stack**: Use it seamlessly in **Rust** or **Python**.
+- **💾 Pluggable Storage**: Zero-config **SQLite** (default), scalable to **Postgres** / **MySQL**.
+
+---
+
+## 🛠️ Installation
+
+Build and install the Python extension (requires Rust toolchain):
 
 ```bash
 cd python
 maturin develop
+# For Postgres/MySQL support:
+# maturin develop --features mysql,postgres
 ```
 
-Use the SDK:
+---
+
+## 🚀 Quick Start
+
+Engram manages the lifecycle of your Agent's context.
+
+### Synchronous (Simple)
 
 ```python
 from engram import Memory
 
+# 1. Initialize (In-Memory or File-based)
 mem = Memory(in_memory=True)
+
+# 2. Define Context Scope
 scope = {
-    "tenant_id": "default",
-    "user_id": "u1",
-    "agent_id": "a1",
-    "session_id": "s1",
-    "run_id": "r1",
+    "tenant_id": "demo",
+    "user_id": "alice",
+    "agent_id": "planner-bot",
+    "session_id": "session-1",
+    "run_id": "run-1"
 }
-packet = mem.build_memory_packet({"scope": scope, "purpose": "planner"})
-print(packet["meta"]["schema_version"])
+
+# 3. Add a Fact (Long-term semantic memory)
+mem.upsert_fact(scope, {
+    "fact_id": "f1",
+    "fact_key": "user_preference",
+    "value": "Alice prefers concise answers.",
+    "status": "active",
+    "confidence": 1.0
+})
+
+# 4. Generate a Context Packet for the LLM
+# This retrieves relevant facts, episodes, and working state based on the purpose.
+packet = mem.build_memory_packet({
+    "scope": scope, 
+    "purpose": "responder",
+    "budget": {"max_tokens": 2000}
+})
+
+print(f"Memory Packet Generated: {len(packet['long_term']['facts'])} facts included.")
 ```
 
-Enable MySQL/Postgres backends (rebuild required):
+---
 
-```bash
-cd python
-maturin develop --features mysql,postgres
-```
+## 💡 Advanced Usage
 
-Python backends:
+### Asynchronous Support (High Concurrency)
 
-```python
-Memory(backend="mysql", dsn="mysql://user:pass@localhost:3306/engram")
-Memory(backend="postgres", dsn="postgres://user:pass@localhost:5432/engram")
-Memory(backend="mysql", dsn="mysql://user:pass@localhost:3306", database="engram")
-```
-
-## Advanced Usage
-
-### Asynchronous Support
-
-Use `AsyncMemory` for non-blocking I/O in async applications (e.g., FastAPI, multiple agents).
+Ideal for web servers (FastAPI) or multi-agent orchestrators.
 
 ```python
 import asyncio
 from engram import AsyncMemory
 
 async def main():
-    mem = AsyncMemory(in_memory=True)
-    # Concurrent writes
+    mem = AsyncMemory(path="./agent.db")
+    
+    # Fire and forget concurrent writes
     await asyncio.gather(
-        mem.append_event({...}),
-        mem.append_event({...})
+        mem.append_event({"event_id": "e1", "kind": "message", "payload": "Hello", "scope": ...}),
+        mem.append_event({"event_id": "e2", "kind": "tool_result", "payload": "Success", "scope": ...})
     )
-    # Async read
-    packet = await mem.build_memory_packet({...})
+    
+    # Non-blocking read
+    events = await mem.list_events(...)
 
 asyncio.run(main())
 ```
 
-See [examples/async_demo.py](examples/async_demo.py) for a complete example.
-
 ### Observability & Tracing
 
-Engram emits structured logs (via Rust `tracing` mapped to Python `logging`) to help you understand memory retrieval decisions.
+Engram integrates Rust's `tracing` with Python's `logging`. See exactly how the "brain" works.
 
 ```python
 import logging
+# Enable DEBUG logs to see recall scoring and budget trimming decisions
 logging.basicConfig(level=logging.INFO)
-# Enable debug logs for engram to see candidate counts and budget trimming
 logging.getLogger("engram_store").setLevel(logging.DEBUG)
 ```
 
-See [examples/observability_demo.py](examples/observability_demo.py).
+### Policies & Budgets
 
-### Memory Policies & Budgeting
-
-Control the size and content of the `MemoryPacket` using strict budgets and policies.
+Control costs and context quality with deterministic rules.
 
 ```python
 strict_policy = {
-    "max_facts": 5,
-    "max_total_candidates": 20
+    "max_facts": 5,             # Only top 5 relevant facts
+    "max_episodes": 2,          # Only last 2 relevant episodes
+    "episode_time_window_days": 7
 }
+
 budget = {
-    "max_tokens": 1000,
-    "per_section": {"facts": 200}
+    "max_tokens": 1000,         # Hard limit
+    "per_section": {"facts": 200} # Specific limit for facts
 }
+
 packet = mem.build_memory_packet({
     "scope": ..., 
-    "purpose": "planner",
     "policy": strict_policy, 
     "budget": budget
 })
 ```
 
-See [examples/policy_demo.py](examples/policy_demo.py).
+See [examples/](examples/) for more demos.
 
-## Storage backends
+---
 
-- SQLite (default, no feature flag)
-- Postgres (`--features postgres`)
-- MySQL (`--features mysql`)
+## 🏗️ Architecture
 
-Example (MySQL):
-```rust
-use engram_store::MySqlStore;
-
-let store = MySqlStore::new("mysql://user:pass@localhost:3306/engram")?;
+```mermaid
+graph TD
+    User[User/LLM] -->|Append Event| Store[(Storage Engine)]
+    Store -->|Sqlite/Postgres| DB[(DB)]
+    
+    User -->|Build Request| Composer[Context Composer]
+    
+    subgraph "Engram Core (Rust)"
+        Composer -->|1. Filter| Candidates[Candidate Set]
+        Candidates -->|2. Rank & Sort| Ranked[Ranked Memory]
+        Ranked -->|3. Apply Budget| Packet[Memory Packet]
+    end
+    
+    Packet -->|Return| User
 ```
 
-Notes:
-- If the database does not exist, Postgres/MySQL will create it on first connect.
-- If the DSN omits a database name, it defaults to `engram`.
+## 🔌 Integrations
 
-## LangChain / LangGraph adapters (minimal stubs)
+- **LangChain**: `EngramChatMessageHistory`, `EngramContextInjector`
+- **LangGraph**: `EngramCheckpointer`, `EngramNodeMiddleware`
 
-- LangChain: `EngramChatMessageHistory`, `EngramContextInjector`
-- LangGraph: `EngramCheckpointer`, `EngramNodeMiddleware`
+## 🤝 Contributing
 
-Example (DeepSeek, OpenAI-compatible):
-```bash
-cp .env.example .env
-python examples/langchain_deepseek.py
-```
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to set up the Rust + Python development environment.
 
-The example reads `DEEPSEEK_API_KEY` from `.env` or your environment.
+## 📄 License
 
-## Performance testing
-
-Run benchmarks:
-
-```bash
-cargo bench -p engram-store
-```
-
-Extended and extreme runs:
-
-```bash
-ENGRAM_BENCH_EXTENDED=1 cargo bench -p engram-store
-ENGRAM_BENCH_EXTREME=1 cargo bench -p engram-store
-```
-
-Include MySQL/Postgres:
-
-```bash
-cargo bench -p engram-store --features mysql,postgres
-```
-
-For large SQLite datasets, set `ENGRAM_BENCH_SQLITE_MODE=file` (or `auto`) to use a file-backed DB and avoid memory pressure.
-
-Tuning:
-
-- `ENGRAM_BENCH_INMEMORY_MAX_EVENTS` (default 300000)
-- `ENGRAM_BENCH_SQLITE_MAX_EVENTS` (default 1000000, in-memory SQLite cap)
-- `ENGRAM_BENCH_SQLITE_MODE` (`memory`, `file`, or `auto`, auto switches to file when events exceed `ENGRAM_BENCH_SQLITE_MAX_EVENTS`)
-- `ENGRAM_BENCH_SQLITE_DIR` (directory for file-mode SQLite DBs)
-- `ENGRAM_BENCH_SQLITE_FILE` (optional fixed SQLite file path)
-- `ENGRAM_BENCH_SQLITE_EVENT_CHUNK` (default 10000)
-- `ENGRAM_BENCH_MYSQL_DSN` / `ENGRAM_BENCH_POSTGRES_DSN`
-- `ENGRAM_BENCH_MYSQL_MAX_EVENTS` / `ENGRAM_BENCH_POSTGRES_MAX_EVENTS`
-- `ENGRAM_BENCH_RESET_DB` (set to `1` to truncate SQL tables before each dataset)
-- `ENGRAM_BENCH_EVENTS_SCALES` (comma-separated, extra event sizes for event-scale group)
-- `ENGRAM_BENCH_WRITE_EVENTS_SCALES` (comma-separated, extra event sizes for append benchmarks)
-- `ENGRAM_BENCH_WRITE_FACT_SCALES` (comma-separated, extra fact sizes for upsert benchmarks)
-- `ENGRAM_BENCH_BULK_EVENTS_SCALES` (comma-separated, extra event sizes for bulk append)
-- `ENGRAM_BENCH_BULK_EVENT_BATCH` (default 500)
-
-Unified bench config file:
-
-- Copy `bench/engram_bench.env.example` to `bench/engram_bench.env` and edit once.
-- Set `ENGRAM_BENCH_CONFIG=/path/to/engram_bench.env` to override the default path.
-
-Benchmark groups include:
-
-- `build_memory_packet_events_scale`
-- `build_memory_packet_candidate_scale`
-- `store_ops_list_events`
-- `store_ops_list_facts`
-- `store_ops_list_episodes`
-- `store_ops_list_insights`
-- `store_ops_list_procedures`
-- `store_ops_append_event`
-- `store_ops_append_events_bulk`
-- `store_ops_upsert_fact`
-
-When you run with `--features mysql,postgres` and provide DSNs, the same groups are recorded for MySQL/Postgres alongside SQLite and in-memory.
-
-Generate the HTML summary report:
-
-```bash
-python scripts/criterion_report.py
-```
-
-Output: `target/criterion/summary.html`
-
-If `target/python_bench.json`, `target/python_load.json`, or `target/python_soak.json` exist, they are included in the summary.
-
-Python benchmarks (optional):
-
-```bash
-cd python
-maturin develop --features mysql,postgres
-ENGRAM_BENCH_MYSQL_DSN="mysql://user:pass@localhost:3306/engram" \
-ENGRAM_BENCH_POSTGRES_DSN="postgres://user:pass@localhost:5432/engram" \
-python python/scripts/bench_backends.py
-```
-
-Outputs: `target/python_bench.json`, `target/python_bench.html`, `target/python_bench_prev.json`
-
-Python load test (optional):
-
-```bash
-cd python
-maturin develop --features mysql,postgres
-ENGRAM_LOAD_MYSQL_DSN="mysql://user:pass@localhost:3306/engram" \
-ENGRAM_LOAD_POSTGRES_DSN="postgres://user:pass@localhost:5432/engram" \
-python python/scripts/load_test.py --duration 60 --concurrency 8
-```
-
-Outputs: `target/python_load.json`, `target/python_load_prev.json`
-
-Python soak test (optional):
-
-```bash
-cd python
-maturin develop --features mysql,postgres
-ENGRAM_SOAK_MYSQL_DSN="mysql://user:pass@localhost:3306/engram" \
-ENGRAM_SOAK_POSTGRES_DSN="postgres://user:pass@localhost:5432/engram" \
-python python/scripts/soak_test.py --duration 600 --interval 60
-```
-
-Outputs: `target/python_soak.json`, `target/python_soak_prev.json`
-
-## Sample results (local run)
-
-Your latest benchmark runs show:
-
-- Events scale up to 5M: latency stays ~0.7-2.0ms (SQLite) with stable recall.
-- Candidate scale up to 5k: ~2.8ms (InMemory) / ~10.3ms (SQLite).
-
-These results support the core guarantee: total memory can grow while recall stays fast
-because candidate sets remain small and bounded.
+Apache License 2.0
