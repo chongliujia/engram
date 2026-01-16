@@ -1,13 +1,59 @@
-.env
-python/.env
-bench/engram_bench.env
-
-# Rust build artifacts
+# --- Rust ---
 target/
-**/target/
+**/*.rs.bk
+Cargo.lock
 
-# SQLite / DB artifacts (optional, but recommended for benches)
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# --- Maturin / Binary Extensions ---
+# 忽略 Python 源码目录下的原生二进制模块
+python/src/engram/_core.*
+
+# --- Databases & Data ---
+# 忽略本地 SQLite 数据库及临时日志
 *.db
-*.sqlite
-*.sqlite3
+*.db-shm
+*.db-wal
+data/
+# 如果有特定的本地测试库目录
+python/data/
 
+# --- Configuration & Secrets ---
+.env
+.env.local
+.env.*.local
+# 这里的 .env.example 不应该被忽略（已在仓库中）
+
+# --- Benchmarks & Reports ---
+target/criterion/
+target/*.json
+target/*.html
+engram_bench.env
+
+# --- OS Specific ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo

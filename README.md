@@ -65,6 +65,67 @@ Memory(backend="postgres", dsn="postgres://user:pass@localhost:5432/engram")
 Memory(backend="mysql", dsn="mysql://user:pass@localhost:3306", database="engram")
 ```
 
+## Advanced Usage
+
+### Asynchronous Support
+
+Use `AsyncMemory` for non-blocking I/O in async applications (e.g., FastAPI, multiple agents).
+
+```python
+import asyncio
+from engram import AsyncMemory
+
+async def main():
+    mem = AsyncMemory(in_memory=True)
+    # Concurrent writes
+    await asyncio.gather(
+        mem.append_event({...}),
+        mem.append_event({...})
+    )
+    # Async read
+    packet = await mem.build_memory_packet({...})
+
+asyncio.run(main())
+```
+
+See [examples/async_demo.py](examples/async_demo.py) for a complete example.
+
+### Observability & Tracing
+
+Engram emits structured logs (via Rust `tracing` mapped to Python `logging`) to help you understand memory retrieval decisions.
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+# Enable debug logs for engram to see candidate counts and budget trimming
+logging.getLogger("engram_store").setLevel(logging.DEBUG)
+```
+
+See [examples/observability_demo.py](examples/observability_demo.py).
+
+### Memory Policies & Budgeting
+
+Control the size and content of the `MemoryPacket` using strict budgets and policies.
+
+```python
+strict_policy = {
+    "max_facts": 5,
+    "max_total_candidates": 20
+}
+budget = {
+    "max_tokens": 1000,
+    "per_section": {"facts": 200}
+}
+packet = mem.build_memory_packet({
+    "scope": ..., 
+    "purpose": "planner",
+    "policy": strict_policy, 
+    "budget": budget
+})
+```
+
+See [examples/policy_demo.py](examples/policy_demo.py).
+
 ## Storage backends
 
 - SQLite (default, no feature flag)

@@ -19,10 +19,11 @@ use pyo3::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 #[pyclass]
 struct EngramStore {
-    inner: Box<dyn Store>,
+    inner: Arc<dyn Store>,
 }
 
 #[pymethods]
@@ -37,20 +38,32 @@ impl EngramStore {
         in_memory: bool,
     ) -> PyResult<Self> {
         let store = open_store(path, backend, dsn, database, in_memory).map_err(store_error)?;
-        Ok(Self { inner: store })
+        Ok(Self { inner: Arc::from(store) })
     }
 
     #[staticmethod]
     fn in_memory() -> PyResult<Self> {
         let inner: Box<dyn Store> =
             Box::new(SqliteStore::new_in_memory().map_err(store_error)?);
-        Ok(Self { inner })
+        Ok(Self { inner: Arc::from(inner) })
     }
 
     fn append_event(&self, event_json: &str) -> PyResult<()> {
         let input: EventInput = parse_json(event_json)?;
         let event = input.to_event()?;
         self.inner.append_event(event).map_err(store_error)
+    }
+
+    fn async_append_event<'p>(&self, py: Python<'p>, event_json: String) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let input: EventInput = parse_json(&event_json)?;
+            let event = input.to_event()?;
+            tokio::task::spawn_blocking(move || {
+                store.append_event(event).map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
     }
 
     fn list_events(
@@ -72,6 +85,31 @@ impl EngramStore {
         to_json(&output)
     }
 
+    fn async_list_events<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        range_json: Option<String>,
+        limit: Option<usize>,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let range = match range_json {
+                Some(payload) => parse_json::<TimeRangeInput>(&payload)?.to_filter()?,
+                None => TimeRangeFilter::default(),
+            };
+            let json = tokio::task::spawn_blocking(move || {
+                let events = store
+                    .list_events(&scope, range, limit)
+                    .map_err(store_error)?;
+                let output: Vec<EventOutput> = events.into_iter().map(EventOutput::from).collect();
+                to_json(&output)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
+
     fn get_working_state(&self, scope_json: &str) -> PyResult<Option<String>> {
         let scope: Scope = parse_json(scope_json)?;
         let state = self.inner.get_working_state(&scope).map_err(store_error)?;
@@ -79,6 +117,21 @@ impl EngramStore {
             Some(state) => Ok(Some(to_json(&state)?)),
             None => Ok(None),
         }
+    }
+
+    fn async_get_working_state<'p>(&self, py: Python<'p>, scope_json: String) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let json = tokio::task::spawn_blocking(move || -> PyResult<Option<String>> {
+                let state = store.get_working_state(&scope).map_err(store_error)?;
+                match state {
+                    Some(state) => Ok(Some(to_json(&state)?)),
+                    None => Ok(None),
+                }
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
     }
 
     fn patch_working_state(&self, scope_json: &str, patch_json: &str) -> PyResult<String> {
@@ -92,6 +145,27 @@ impl EngramStore {
         to_json(&state)
     }
 
+    fn async_patch_working_state<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        patch_json: String,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let patch_input: WorkingStatePatchInput = parse_json(&patch_json)?;
+            let patch = patch_input.to_patch();
+            let json = tokio::task::spawn_blocking(move || {
+                let state = store
+                    .patch_working_state(&scope, patch)
+                    .map_err(store_error)?;
+                to_json(&state)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
+
     fn get_stm(&self, scope_json: &str) -> PyResult<Option<String>> {
         let scope: Scope = parse_json(scope_json)?;
         let state = self.inner.get_stm(&scope).map_err(store_error)?;
@@ -99,6 +173,21 @@ impl EngramStore {
             Some(state) => Ok(Some(to_json(&StmStateOutput::from(state))?)),
             None => Ok(None),
         }
+    }
+
+    fn async_get_stm<'p>(&self, py: Python<'p>, scope_json: String) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let json = tokio::task::spawn_blocking(move || -> PyResult<Option<String>> {
+                let state = store.get_stm(&scope).map_err(store_error)?;
+                match state {
+                    Some(state) => Ok(Some(to_json(&StmStateOutput::from(state))?)),
+                    None => Ok(None),
+                }
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
     }
 
     fn update_stm(&self, scope_json: &str, stm_json: &str) -> PyResult<()> {
@@ -109,6 +198,22 @@ impl EngramStore {
             key_quotes: input.key_quotes,
         };
         self.inner.update_stm(&scope, stm).map_err(store_error)
+    }
+
+    fn async_update_stm<'p>(&self, py: Python<'p>, scope_json: String, stm_json: String) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let input: StmStateInput = parse_json(&stm_json)?;
+            let stm = StmState {
+                rolling_summary: input.rolling_summary,
+                key_quotes: input.key_quotes,
+            };
+            tokio::task::spawn_blocking(move || {
+                store.update_stm(&scope, stm).map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
     }
 
     fn list_facts(&self, scope_json: &str, filter_json: Option<&str>) -> PyResult<String> {
@@ -124,10 +229,45 @@ impl EngramStore {
         to_json(&facts)
     }
 
+    fn async_list_facts<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        filter_json: Option<String>,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let filter = match filter_json {
+                Some(payload) => parse_json::<FactFilterInput>(&payload)?.to_filter()?,
+                None => FactFilter::default(),
+            };
+            let json = tokio::task::spawn_blocking(move || {
+                let facts = store
+                    .list_facts(&scope, filter)
+                    .map_err(store_error)?;
+                to_json(&facts)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
+
     fn upsert_fact(&self, scope_json: &str, fact_json: &str) -> PyResult<()> {
         let scope: Scope = parse_json(scope_json)?;
         let fact: Fact = parse_json(fact_json)?;
         self.inner.upsert_fact(&scope, fact).map_err(store_error)
+    }
+
+    fn async_upsert_fact<'p>(&self, py: Python<'p>, scope_json: String, fact_json: String) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let fact: Fact = parse_json(&fact_json)?;
+            tokio::task::spawn_blocking(move || {
+                store.upsert_fact(&scope, fact).map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
     }
 
     fn list_episodes(&self, scope_json: &str, filter_json: Option<&str>) -> PyResult<String> {
@@ -143,12 +283,49 @@ impl EngramStore {
         to_json(&episodes)
     }
 
+    fn async_list_episodes<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        filter_json: Option<String>,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let filter = match filter_json {
+                Some(payload) => parse_json::<EpisodeFilterInput>(&payload)?.to_filter()?,
+                None => EpisodeFilter::default(),
+            };
+            let json = tokio::task::spawn_blocking(move || {
+                let episodes = store
+                    .list_episodes(&scope, filter)
+                    .map_err(store_error)?;
+                to_json(&episodes)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
+
     fn append_episode(&self, scope_json: &str, episode_json: &str) -> PyResult<()> {
         let scope: Scope = parse_json(scope_json)?;
         let episode: Episode = parse_json(episode_json)?;
         self.inner
             .append_episode(&scope, episode)
             .map_err(store_error)
+    }
+
+    fn async_append_episode<'p>(&self, py: Python<'p>, scope_json: String, episode_json: String) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let episode: Episode = parse_json(&episode_json)?;
+            tokio::task::spawn_blocking(move || {
+                store
+                    .append_episode(&scope, episode)
+                    .map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
     }
 
     fn list_procedures(
@@ -165,12 +342,51 @@ impl EngramStore {
         to_json(&procedures)
     }
 
+    fn async_list_procedures<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        task_type: String,
+        limit: Option<usize>,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let json = tokio::task::spawn_blocking(move || {
+                let procedures = store
+                    .list_procedures(&scope, &task_type, limit)
+                    .map_err(store_error)?;
+                to_json(&procedures)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
+
     fn upsert_procedure(&self, scope_json: &str, procedure_json: &str) -> PyResult<()> {
         let scope: Scope = parse_json(scope_json)?;
         let procedure: Procedure = parse_json(procedure_json)?;
         self.inner
             .upsert_procedure(&scope, procedure)
             .map_err(store_error)
+    }
+
+    fn async_upsert_procedure<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        procedure_json: String,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let procedure: Procedure = parse_json(&procedure_json)?;
+            tokio::task::spawn_blocking(move || {
+                store
+                    .upsert_procedure(&scope, procedure)
+                    .map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
     }
 
     fn list_insights(&self, scope_json: &str, filter_json: Option<&str>) -> PyResult<String> {
@@ -186,12 +402,54 @@ impl EngramStore {
         to_json(&insights)
     }
 
+    fn async_list_insights<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        filter_json: Option<String>,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let filter = match filter_json {
+                Some(payload) => parse_json::<InsightFilterInput>(&payload)?.to_filter()?,
+                None => InsightFilter::default(),
+            };
+            let json = tokio::task::spawn_blocking(move || {
+                let insights = store
+                    .list_insights(&scope, filter)
+                    .map_err(store_error)?;
+                to_json(&insights)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
+
     fn append_insight(&self, scope_json: &str, insight_json: &str) -> PyResult<()> {
         let scope: Scope = parse_json(scope_json)?;
         let insight: InsightItem = parse_json(insight_json)?;
         self.inner
             .append_insight(&scope, insight)
             .map_err(store_error)
+    }
+
+    fn async_append_insight<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        insight_json: String,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let insight: InsightItem = parse_json(&insight_json)?;
+            tokio::task::spawn_blocking(move || {
+                store
+                    .append_insight(&scope, insight)
+                    .map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
     }
 
     fn write_context_build(&self, scope_json: &str, packet_json: &str) -> PyResult<()> {
@@ -202,6 +460,25 @@ impl EngramStore {
             .map_err(store_error)
     }
 
+    fn async_write_context_build<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        packet_json: String,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let packet: MemoryPacket = parse_json(&packet_json)?;
+            tokio::task::spawn_blocking(move || {
+                store
+                    .write_context_build(&scope, packet)
+                    .map_err(store_error)
+            }).await.map_err(py_error)??;
+            Ok(())
+        })
+    }
+
     fn list_context_builds(&self, scope_json: &str, limit: Option<usize>) -> PyResult<String> {
         let scope: Scope = parse_json(scope_json)?;
         let packets = self
@@ -209,6 +486,25 @@ impl EngramStore {
             .list_context_builds(&scope, limit)
             .map_err(store_error)?;
         to_json(&packets)
+    }
+
+    fn async_list_context_builds<'p>(
+        &self,
+        py: Python<'p>,
+        scope_json: String,
+        limit: Option<usize>,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let scope: Scope = parse_json(&scope_json)?;
+            let json = tokio::task::spawn_blocking(move || {
+                let packets = store
+                    .list_context_builds(&scope, limit)
+                    .map_err(store_error)?;
+                to_json(&packets)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
     }
 
     fn build_memory_packet(&self, request_json: &str) -> PyResult<String> {
@@ -237,10 +533,48 @@ impl EngramStore {
         let packet = build_memory_packet(self.inner.as_ref(), request).map_err(store_error)?;
         to_json(&packet)
     }
+
+    fn async_build_memory_packet<'p>(
+        &self,
+        py: Python<'p>,
+        request_json: String,
+    ) -> PyResult<&'p PyAny> {
+        let store = self.inner.clone();
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let input: BuildRequestInput = parse_json(&request_json)?;
+            let mut request = BuildRequest::new(input.scope, input.purpose);
+
+            if let Some(task_type) = input.task_type {
+                request.task_type = Some(task_type);
+            }
+            if let Some(cues) = input.cues {
+                request.cues = cues.to_cues()?;
+            }
+            if let Some(budget) = input.budget {
+                request.budget = budget;
+            }
+            if let Some(policy_id) = input.policy_id {
+                request.policy_id = policy_id;
+            }
+            if let Some(policy) = input.policy {
+                request.policy = policy.apply_to(RecallPolicy::default());
+            }
+            if let Some(persist) = input.persist {
+                request.persist = persist;
+            }
+
+            let json = tokio::task::spawn_blocking(move || {
+                let packet = build_memory_packet(store.as_ref(), request).map_err(store_error)?;
+                to_json(&packet)
+            }).await.map_err(py_error)??;
+            Ok(json)
+        })
+    }
 }
 
 #[pymodule]
-fn _core(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _core(_py: Python, module: &PyModule) -> PyResult<()> {
+    pyo3_log::init();
     module.add_class::<EngramStore>()?;
     Ok(())
 }

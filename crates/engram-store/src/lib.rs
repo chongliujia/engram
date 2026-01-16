@@ -31,6 +31,19 @@ pub enum StoreError {
     Storage(String),
 }
 
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::NotFound => write!(f, "item not found"),
+            StoreError::Poisoned => write!(f, "lock poisoned"),
+            StoreError::InvalidInput(msg) => write!(f, "invalid input: {}", msg),
+            StoreError::Storage(msg) => write!(f, "storage error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
 impl From<rusqlite::Error> for StoreError {
     fn from(err: rusqlite::Error) -> Self {
         StoreError::Storage(err.to_string())

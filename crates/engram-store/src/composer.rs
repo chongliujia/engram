@@ -13,6 +13,7 @@ use crate::{
     EpisodeFilter, Event, EventKind, FactFilter, InsightFilter, Store, StoreResult, StmState,
     TimeRangeFilter,
 };
+use tracing::{debug, info, instrument, warn};
 
 #[derive(Debug, Clone, Default)]
 pub struct RecallCues {
@@ -84,6 +85,7 @@ impl BuildRequest {
     }
 }
 
+#[instrument(skip(store), fields(scope = ?request.scope, purpose = ?request.purpose))]
 pub fn build_memory_packet<S: Store + ?Sized>(
     store: &S,
     request: BuildRequest,
@@ -93,6 +95,8 @@ pub fn build_memory_packet<S: Store + ?Sized>(
         .task_type
         .clone()
         .unwrap_or_else(|| "generic".to_string());
+    
+    debug!("Starting build_memory_packet");
 
     let working_state = store
         .get_working_state(&request.scope)?
@@ -143,8 +147,16 @@ pub fn build_memory_packet<S: Store + ?Sized>(
     apply_budget(&request, &mut packet);
 
     if request.persist {
-        store.write_context_build(&request.scope, packet.clone())?;
+        if let Err(e) = store.write_context_build(&request.scope, packet.clone()) {
+            warn!("Failed to persist context build: {}", e);
+        }
     }
+    
+    info!(
+        candidates.facts = packet.long_term.facts.len(),
+        candidates.episodes = packet.long_term.episodes.len(),
+        "Memory packet built"
+    );
 
     Ok(packet)
 }
@@ -202,6 +214,11 @@ fn load_facts<S: Store + ?Sized>(
     });
 
     if facts.len() > max_facts {
+        debug!(
+            "Trimming facts from {} to limit {}",
+            facts.len(),
+            max_facts
+        );
         facts.truncate(max_facts);
     }
 
@@ -257,6 +274,11 @@ fn load_episodes<S: Store + ?Sized>(
             .then_with(|| a.episode_id.cmp(&b.episode_id))
     });
     if episodes.len() > request.policy.max_episodes {
+        debug!(
+            "Trimming episodes from {} to limit {}",
+            episodes.len(),
+            request.policy.max_episodes
+        );
         episodes.truncate(request.policy.max_episodes);
     }
     Ok(episodes)
@@ -631,6 +653,10 @@ fn trim_to_budget(request: &BuildRequest, packet: &mut MemoryPacket, omissions: 
     }
 
     let mut total_tokens = estimate_packet_tokens(packet);
+    if total_tokens > request.budget.max_tokens {
+        debug!("Packet tokens {} exceeds budget {}, starting trim", total_tokens, request.budget.max_tokens);
+    }
+
     while total_tokens > request.budget.max_tokens {
         let dropped = if drop_last_insight(&mut packet.insight, omissions) {
             true
@@ -649,6 +675,7 @@ fn trim_to_budget(request: &BuildRequest, packet: &mut MemoryPacket, omissions: 
         };
 
         if !dropped {
+            warn!("Unable to trim packet further, stopping at {} tokens", total_tokens);
             break;
         }
         total_tokens = estimate_packet_tokens(packet);

@@ -80,3 +80,90 @@ class Memory:
 
     def build_memory_packet(self, request):
         return json.loads(self._store.build_memory_packet(json.dumps(request)))
+
+
+class AsyncMemory:
+    def __init__(
+        self,
+        path="data/engram.db",
+        in_memory=False,
+        backend="sqlite",
+        dsn=None,
+        database=None,
+    ):
+        self._store = EngramStore(
+            path=path,
+            backend=backend,
+            dsn=dsn,
+            database=database,
+            in_memory=in_memory,
+        )
+
+    async def append_event(self, event):
+        await self._store.async_append_event(json.dumps(event))
+
+    async def list_events(self, scope, time_range=None, limit=None):
+        payload = json.dumps(time_range) if time_range is not None else None
+        data = await self._store.async_list_events(json.dumps(scope), payload, limit)
+        return json.loads(data)
+
+    async def get_working_state(self, scope):
+        data = await self._store.async_get_working_state(json.dumps(scope))
+        return json.loads(data) if data is not None else None
+
+    async def patch_working_state(self, scope, patch):
+        data = await self._store.async_patch_working_state(
+            json.dumps(scope), json.dumps(patch)
+        )
+        return json.loads(data)
+
+    async def get_stm(self, scope):
+        data = await self._store.async_get_stm(json.dumps(scope))
+        return json.loads(data) if data is not None else None
+
+    async def update_stm(self, scope, stm_state):
+        await self._store.async_update_stm(json.dumps(scope), json.dumps(stm_state))
+
+    async def list_facts(self, scope, fact_filter=None):
+        payload = json.dumps(fact_filter) if fact_filter is not None else None
+        data = await self._store.async_list_facts(json.dumps(scope), payload)
+        return json.loads(data)
+
+    async def upsert_fact(self, scope, fact):
+        await self._store.async_upsert_fact(json.dumps(scope), json.dumps(fact))
+
+    async def list_episodes(self, scope, episode_filter=None):
+        payload = json.dumps(episode_filter) if episode_filter is not None else None
+        data = await self._store.async_list_episodes(json.dumps(scope), payload)
+        return json.loads(data)
+
+    async def append_episode(self, scope, episode):
+        await self._store.async_append_episode(json.dumps(scope), json.dumps(episode))
+
+    async def list_procedures(self, scope, task_type, limit=None):
+        data = await self._store.async_list_procedures(
+            json.dumps(scope), task_type, limit
+        )
+        return json.loads(data)
+
+    async def upsert_procedure(self, scope, procedure):
+        await self._store.async_upsert_procedure(json.dumps(scope), json.dumps(procedure))
+
+    async def list_insights(self, scope, insight_filter=None):
+        payload = json.dumps(insight_filter) if insight_filter is not None else None
+        data = await self._store.async_list_insights(json.dumps(scope), payload)
+        return json.loads(data)
+
+    async def append_insight(self, scope, insight):
+        await self._store.async_append_insight(json.dumps(scope), json.dumps(insight))
+
+    async def write_context_build(self, scope, packet):
+        await self._store.async_write_context_build(json.dumps(scope), json.dumps(packet))
+
+    async def list_context_builds(self, scope, limit=None):
+        data = await self._store.async_list_context_builds(json.dumps(scope), limit)
+        return json.loads(data)
+
+    async def build_memory_packet(self, request):
+        data = await self._store.async_build_memory_packet(json.dumps(request))
+        return json.loads(data)

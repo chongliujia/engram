@@ -10,7 +10,10 @@ crate-type = ["cdylib"]
 chrono = { version = "0.4", features = ["serde"] }
 engram-store = { path = "../engram-store" }
 engram-types = { path = "../engram-types" }
-pyo3 = { version = "0.21", features = ["extension-module"] }
+pyo3 = { version = "0.20", features = ["extension-module"] }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+pyo3-log = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

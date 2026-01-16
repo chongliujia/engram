@@ -3,13 +3,14 @@ use engram_types::{
     CompressionLevel, Episode, Fact, FactStatus, InsightItem, InsightTrigger, InsightType,
     MemoryPacket, Procedure, Scope, ScopeLevel, ValidationState, WorkingState,
 };
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::{Type, Value as SqlValue};
 use rusqlite::{params_from_iter, Connection};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use crate::{
     EpisodeFilter, Event, EventKind, FactFilter, InsightFilter, StmState, Store, StoreError,
@@ -20,7 +21,7 @@ const SCHEMA_VERSION: i64 = 1;
 
 pub struct SqliteStore {
     path: PathBuf,
-    connection: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -42,22 +43,33 @@ impl SqliteStore {
             std::fs::create_dir_all(parent)
                 .map_err(|err| StoreError::Storage(err.to_string()))?;
         }
-        let conn = Connection::open(&path)?;
-        configure_connection(&conn, true)?;
-        ensure_schema(&conn)?;
+        
+        let manager = SqliteConnectionManager::file(&path)
+            .with_init(|conn| configure_connection(conn, true));
+        let pool = Pool::new(manager)
+            .map_err(|err| StoreError::Storage(err.to_string()))?;
+        
+        let mut conn = pool.get().map_err(|err| StoreError::Storage(err.to_string()))?;
+        ensure_schema(&mut conn)?;
+        
         Ok(Self {
             path,
-            connection: Mutex::new(conn),
+            pool,
         })
     }
 
     pub fn new_in_memory() -> StoreResult<Self> {
-        let conn = Connection::open_in_memory()?;
-        configure_connection(&conn, false)?;
-        ensure_schema(&conn)?;
+        let manager = SqliteConnectionManager::memory()
+            .with_init(|conn| configure_connection(conn, false));
+        let pool = Pool::new(manager)
+            .map_err(|err| StoreError::Storage(err.to_string()))?;
+            
+        let mut conn = pool.get().map_err(|err| StoreError::Storage(err.to_string()))?;
+        ensure_schema(&mut conn)?;
+        
         Ok(Self {
             path: PathBuf::from(":memory:"),
-            connection: Mutex::new(conn),
+            pool,
         })
     }
 
@@ -143,12 +155,12 @@ impl SqliteStore {
     where
         F: FnOnce(&mut Connection) -> StoreResult<T>,
     {
-        let mut guard = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
-        f(&mut *guard)
+        let mut conn = self.pool.get().map_err(|err| StoreError::Storage(err.to_string()))?;
+        f(&mut conn)
     }
 }
 
-fn configure_connection(conn: &Connection, use_wal: bool) -> StoreResult<()> {
+fn configure_connection(conn: &mut Connection, use_wal: bool) -> Result<(), rusqlite::Error> {
     if use_wal {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;

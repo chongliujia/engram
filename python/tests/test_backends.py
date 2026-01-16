@@ -77,5 +77,24 @@ class BackendSmokeTests(unittest.TestCase):
         roundtrip_memory(mem, self)
 
 
+class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_sqlite_memory(self):
+        from engram import AsyncMemory
+
+        mem = AsyncMemory(in_memory=True)
+        scope = sample_scope()
+        event_id = f"e-{unique_suffix()}"
+        await mem.append_event(sample_event(scope, event_id))
+
+        events = await mem.list_events(scope)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], event_id)
+
+        packet = await mem.build_memory_packet(
+            {"scope": scope, "purpose": "planner", "task_type": "generic"}
+        )
+        self.assertEqual(packet["meta"]["scope"]["run_id"], scope["run_id"])
+
+
 if __name__ == "__main__":
     unittest.main()
