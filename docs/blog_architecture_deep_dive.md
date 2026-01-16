@@ -1,6 +1,6 @@
 # Engram 架构内幕：基于 Rust 的高性能 AI 记忆系统详解
 
-**作者**：Engram 核心团队  
+**作者**：Chongliu Jia  
 **发布日期**：2026-01-16  
 **License**：Apache 2.0
 
@@ -53,8 +53,8 @@ graph TD
         DB[("SQLite / Postgres")]
     end
 
-    User -->|await build_memory_packet()| SDK
-    SDK -->|Serialize Request| AsyncIO
+    User -->|"await build_memory_packet()"| SDK
+    SDK -->|"Serialize Request"| AsyncIO
     AsyncIO -->|Future| Bindings
     Bindings -->|spawn_blocking| Dispatcher
     
