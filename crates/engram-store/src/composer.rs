@@ -103,7 +103,7 @@ pub fn build_memory_packet<S: Store + ?Sized>(
         .unwrap_or_default();
     let stm_state = store.get_stm(&request.scope)?.unwrap_or_default();
 
-    let short_term = build_short_term(&working_state, &stm_state, store, &request)?;
+    let short_term = build_short_term(working_state, stm_state, store, &request)?;
 
     let facts = load_facts(store, &request.scope, now, request.policy.max_facts)?;
     let procedures =
@@ -162,21 +162,23 @@ pub fn build_memory_packet<S: Store + ?Sized>(
 }
 
 fn build_short_term<S: Store + ?Sized>(
-    working_state: &engram_types::WorkingState,
-    stm_state: &StmState,
+    working_state: engram_types::WorkingState,
+    stm_state: StmState,
     store: &S,
     request: &BuildRequest,
 ) -> StoreResult<ShortTerm> {
     let mut short_term = ShortTerm::default();
-    short_term.working_state = working_state.clone();
-    short_term.rolling_summary = stm_state.rolling_summary.clone();
+    
+    // Pass by value optimization: move fields instead of cloning
+    short_term.last_tool_evidence = working_state.tool_evidence.clone();
+    short_term.working_state = working_state;
+    short_term.rolling_summary = stm_state.rolling_summary;
 
-    short_term.key_quotes = stm_state.key_quotes.clone();
+    short_term.key_quotes = stm_state.key_quotes;
     if short_term.key_quotes.len() > request.policy.max_key_quotes {
         short_term.key_quotes.truncate(request.policy.max_key_quotes);
     }
 
-    short_term.last_tool_evidence = working_state.tool_evidence.clone();
     if short_term.last_tool_evidence.len() > request.policy.last_tool_evidence_limit {
         short_term
             .last_tool_evidence
@@ -203,7 +205,7 @@ fn load_facts<S: Store + ?Sized>(
         FactFilter {
             status: Some(vec![FactStatus::Active]),
             valid_at: Some(now),
-            limit: None,
+            limit: Some(max_facts),
         },
     )?;
 
@@ -231,7 +233,7 @@ fn load_procedures<S: Store + ?Sized>(
     task_type: &str,
     max_procedures: usize,
 ) -> StoreResult<Vec<engram_types::Procedure>> {
-    let mut procedures = store.list_procedures(scope, task_type, None)?;
+    let mut procedures = store.list_procedures(scope, task_type, Some(max_procedures))?;
     procedures.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
@@ -754,8 +756,9 @@ fn trim_vec_to_budget<T: Serialize, F: Fn(&T) -> String>(
                 "id": id_fn(&item),
                 "reason": "section_budget"
             }));
+            let item_tokens = estimate_tokens(&item);
+            total = total.saturating_sub(item_tokens);
         }
-        total = estimate_tokens(items);
     }
 }
 
@@ -772,35 +775,40 @@ fn trim_turns_to_budget(
             "id": dropped.evidence_id,
             "reason": "section_budget"
         }));
-        total = estimate_tokens(turns);
+        let dropped_tokens = estimate_tokens(&dropped);
+        total = total.saturating_sub(dropped_tokens);
     }
 }
 
 fn trim_insight_to_budget(insight: &mut Insight, max_tokens: u32, omissions: &mut Vec<Value>) {
     let mut total = estimate_tokens(insight);
     while total > max_tokens {
+        let mut dropped_tokens = 0;
         if let Some(item) = insight.hypotheses.pop() {
             omissions.push(json!({
                 "section": "insight.hypotheses",
                 "id": item.id,
                 "reason": "section_budget"
             }));
+            dropped_tokens = estimate_tokens(&item);
         } else if let Some(item) = insight.strategy_sketches.pop() {
             omissions.push(json!({
                 "section": "insight.strategy_sketches",
                 "id": item.id,
                 "reason": "section_budget"
             }));
+            dropped_tokens = estimate_tokens(&item);
         } else if let Some(item) = insight.patterns.pop() {
             omissions.push(json!({
                 "section": "insight.patterns",
                 "id": item.id,
                 "reason": "section_budget"
             }));
+            dropped_tokens = estimate_tokens(&item);
         } else {
             break;
         }
-        total = estimate_tokens(insight);
+        total = total.saturating_sub(dropped_tokens);
     }
 }
 

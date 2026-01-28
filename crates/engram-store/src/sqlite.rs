@@ -43,14 +43,22 @@ impl SqliteStore {
             std::fs::create_dir_all(parent)
                 .map_err(|err| StoreError::Storage(err.to_string()))?;
         }
+
+        // Initialize DB and Schema sequentially before creating the pool
+        // to avoid "database is locked" errors when multiple pool connections
+        // try to set WAL mode or run migrations simultaneously.
+        {
+            let mut conn = Connection::open(&path)
+                .map_err(|err| StoreError::Storage(err.to_string()))?;
+            configure_connection(&mut conn, true)
+                .map_err(|err| StoreError::Storage(err.to_string()))?;
+            ensure_schema(&conn)?;
+        }
         
         let manager = SqliteConnectionManager::file(&path)
             .with_init(|conn| configure_connection(conn, true));
         let pool = Pool::new(manager)
             .map_err(|err| StoreError::Storage(err.to_string()))?;
-        
-        let mut conn = pool.get().map_err(|err| StoreError::Storage(err.to_string()))?;
-        ensure_schema(&mut conn)?;
         
         Ok(Self {
             path,

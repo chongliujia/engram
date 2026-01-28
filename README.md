@@ -145,7 +145,36 @@ packet = mem.build_memory_packet({
 })
 ```
 
-See [examples/](examples/) for more demos.
+See [examples/](examples/) for more demos, including **DeepSeek Integration**.
+
+---
+
+## 📚 Documentation & Resources
+
+- **[DeepSeek Integration Guide](docs/engram_deepseek_guide.md)**: Build a stateful Agent with DeepSeek-V3.
+- **[Architecture Deep Dive](docs/blog_architecture_deep_dive.md)**: Inside the Rust core, concurrency model, and memory hierarchy.
+- **[Memory Packet V1 Spec](docs/MemoryPacket%20v1%20字段级规范表.md)**: Detailed JSON schema reference.
+
+## 🖼️ Visual Demos
+
+See Engram in action with DeepSeek-V3:
+
+| **Cognitive Loop** | **Performance & Budgeting** |
+| :---: | :---: |
+| ![Loop](images/deepseek_loop.png) | ![Budget](images/deepseek_budget.png) |
+| *Full cycle memory consolidation & recall* | *Pushdown limits & O(N) trimming verified* |
+
+| **Task Planning** | **Integrated Recall** |
+| :---: | :---: |
+| ![Planning](images/deepseek_planning.png) | ![Recall](images/deepseek_integrated.png) |
+| *Working state tracking for agents* | *High-precision filtering under strict budget* |
+
+## ⚡ Recent Optimizations (v0.2)
+
+- **Concurrency**: Fixed SQLite startup locking using serialized WAL initialization.
+- **Query Pushdown**: `LIMIT` clauses are now pushed to SQL for Facts and Procedures, reducing I/O.
+- **O(N) Trimming**: Budget trimming algorithm optimized from quadratic to linear complexity.
+- **Zero-Copy**: `WorkingState` and `StmState` are now passed by value to avoid cloning.
 
 ---
 
