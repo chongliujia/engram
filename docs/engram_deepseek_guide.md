@@ -21,7 +21,7 @@ graph LR
     User -->|Input| Agent
     Agent -->|1. Store Event| Engram[(Engram DB)]
     Agent -->|2. Build Context| Engram
-    Engram -->|3. "Memory Packet (JSON)"| Agent
+    Engram -->|3. Memory Packet| Agent
     Agent -->|4. System Prompt + Context| DeepSeek[DeepSeek API]
     DeepSeek -->|5. Response| Agent
 ```
